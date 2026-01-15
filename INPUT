@@ -1,0 +1,749 @@
+function [initial_outage_nodes, cascade_info] = compute_initial_outage_v2(power_net, params)
+%% 计算初始失电状态（考虑级联失电）
+%% ========================================================================
+%% 核心改进：
+%%   使用单商品流法正确计算级联失电
+%%   上游故障节点会导致所有下游节点失电
+%% ========================================================================
+%% 输入:
+%%   power_net - 电力网络结构
+%%   params    - 包含Fset故障节点集合的参数
+%% 输出:
+%%   initial_outage_nodes - 所有失电节点（故障+级联）
+%%   cascade_info - 级联失电详细信息
+%% ========================================================================
+
+N = params.N;
+Fset = params.Fset(:);
+F = length(Fset);
+
+fprintf('\n  === 级联失电计算 (单商品流法) ===\n');
+
+%% 获取网络拓扑
+adj = power_net.adj;
+root = 1;  % 变电站节点
+
+%% 方法: 单商品流法 - 从根节点出发，遇到故障节点则停止
+% 故障节点及其所有下游节点都失电
+
+% 使用BFS找出所有可达节点（不经过故障节点）
+powered_nodes = find_powered_nodes_scf(adj, root, Fset, N);
+
+% 失电节点 = 所有节点 - 有电节点
+all_nodes = (1:N)';
+outage_nodes = setdiff(all_nodes, powered_nodes);
+
+% 级联失电节点 = 失电节点 - 故障节点
+cascade_only_nodes = setdiff(outage_nodes, Fset);
+
+%% 计算失负荷
+PL_kW = power_net.PL_kW;
+total_load_kW = sum(PL_kW);
+lost_load_kW = sum(PL_kW(outage_nodes));
+initial_loss_percent = 100 * lost_load_kW / total_load_kW;
+
+%% 打印详细信息
+fprintf('    故障节点 (%d个): [%s]\n', F, num2str(Fset'));
+fprintf('    级联失电节点 (%d个): [%s]\n', length(cascade_only_nodes), ...
+    num2str(cascade_only_nodes'));
+fprintf('    有电节点 (%d个): [%s]\n', length(powered_nodes), num2str(powered_nodes'));
+fprintf('    总失电节点: %d (占%.1f%%)\n', length(outage_nodes), 100*length(outage_nodes)/N);
+fprintf('    初始失负荷: %.2f kW (%.1f%%)\n', lost_load_kW, initial_loss_percent);
+
+%% 输出
+initial_outage_nodes = outage_nodes;
+
+cascade_info = struct();
+cascade_info.fault_nodes = Fset;
+cascade_info.cascade_only_nodes = cascade_only_nodes;
+cascade_info.powered_nodes = powered_nodes;
+cascade_info.outage_nodes = outage_nodes;
+cascade_info.initial_lost_load_kW = lost_load_kW;
+cascade_info.initial_lost_load_MW = lost_load_kW / 1000;
+cascade_info.initial_loss_percent = initial_loss_percent;
+cascade_info.total_load_kW = total_load_kW;
+
+end
+
+function powered_nodes = find_powered_nodes_scf(adj, root, fault_nodes, N)
+%% 使用单商品流思想找出有电节点
+%% 从根节点出发，只能通过非故障节点传输电力
+%% 故障节点本身失电，其下游也失电
+
+% 将故障节点标记为阻断
+blocked = false(N, 1);
+blocked(fault_nodes) = true;
+
+% 从根节点开始BFS，不经过阻断节点
+powered = false(N, 1);
+queue = [root];
+powered(root) = true;
+
+while ~isempty(queue)
+    current = queue(1);
+    queue(1) = [];
+    
+    neighbors = find(adj(current, :));
+    for nb = neighbors
+        if ~powered(nb) && ~blocked(nb)
+            powered(nb) = true;
+            queue = [queue, nb];
+        end
+    end
+end
+
+powered_nodes = find(powered);
+end
+%% ========================================================================
+%% 洪涝灾害场景生成 (使用用户提供的代码)
+%% ========================================================================
+function [flood_scenario, damaged_status, params] = generate_flood_scenario_v2(power_net, traffic_net, comm_net, params)
+%% 洪涝灾害场景生成（含不确定性故障场景集）
+% 1) 建立若干洪泛区，基于曼宁公式的简化水动力模型生成节点水深
+% 2) 基于HAZUS对数正态脆弱性模型计算故障概率
+% 3) 蒙特卡洛生成大量电力-交通-通信耦合故障场景
+% 4) 按失负荷筛选出"最恶劣场景"，并控制故障规模
+% 5) 更新 params.Fset / params.Wstart 等参数，并生成 damaged_status
+
+N       = params.N;
+coords  = power_net.coords;
+edges   = traffic_net.edges;
+n_roads = traffic_net.n_roads;
+
+%% ---------------- 1. 洪泛区定义 ----------------
+flood_scenario.n_flood_zones = 3;
+
+zone_nodes   = [7, 24, 29];
+zone_radius  = [2.5, 2.0, 3.0];
+flood_scenario.centers = coords(zone_nodes, :);
+flood_scenario.radii  = zone_radius(:);
+
+for z = 1:flood_scenario.n_flood_zones
+    hydro(z).S  = 0.001 + 0.004 * rand();
+    hydro(z).n  = 0.03  + 0.01  * rand();
+    hydro(z).R  = 1.0   + 2.0   * rand();
+    hydro(z).q  = 0.1   + 0.3   * rand();
+    hydro(z).v  = (1/hydro(z).n) * hydro(z).R^(2/3) * sqrt(hydro(z).S);
+    hydro(z).h0 = 0.8 + 0.8 * rand();
+end
+
+%% ---------------- 2. 计算节点水深 ----------------
+node_water_depth = zeros(N, 1);
+
+for z = 1:flood_scenario.n_flood_zones
+    center = flood_scenario.centers(z, :);
+    Rgeo   = flood_scenario.radii(z);
+    h0     = hydro(z).h0;
+
+    dist = vecnorm(coords - center, 2, 2);
+    Reff = 0.7 * Rgeo;
+    local_depth = h0 * exp(-(dist ./ Reff).^2);
+    local_depth(dist > Rgeo) = 0;
+    node_water_depth = max(node_water_depth, local_depth);
+end
+
+node_water_depth = max(0, node_water_depth + 0.02 * rand(N, 1));
+flood_scenario.node_water_depth = node_water_depth;
+
+%% ---------------- 3. 道路水深和阻断状态 ----------------
+road_water_depth = zeros(n_roads, 1);
+water_depth_threshold = 0.5;
+
+for r = 1:n_roads
+    i = traffic_net.from_node(r);
+    j = traffic_net.to_node(r);
+    road_water_depth(r) = max(node_water_depth(i), node_water_depth(j));
+end
+
+candidate_idx = find(road_water_depth > water_depth_threshold);
+n_cand = numel(candidate_idx);
+max_blocked_roads = 4;
+
+road_blocked = false(n_roads, 1);
+if n_cand <= max_blocked_roads
+    road_blocked(candidate_idx) = true;
+else
+    [~, sort_idx] = sort(road_water_depth(candidate_idx), 'descend');
+    sel = candidate_idx(sort_idx(1:max_blocked_roads));
+    road_blocked(sel) = true;
+end
+
+flood_scenario.road_water_depth = road_water_depth;
+
+%% ---------------- 4. HAZUS 对数正态脆弱性模型 ----------------
+p_fail_power = zeros(N, 1);
+theta_p = 0.6;
+beta_p  = 0.5;
+
+for i = 1:N
+    h = node_water_depth(i);
+    if h <= 0
+        p_fail_power(i) = 0;
+    else
+        z = (log(h) - log(theta_p)) / beta_p;
+        p_fail_power(i) = 0.5 * (1 + erf(z / sqrt(2)));
+        p_fail_power(i) = min(max(p_fail_power(i), 0), 0.999);
+    end
+end
+
+p_fail_comm = zeros(N, 1);
+theta_c = theta_p;
+beta_c  = beta_p;
+
+for i = 1:N
+    h = node_water_depth(i);
+    if h <= 0
+        p_fail_comm(i) = 0;
+    else
+        z = (log(h) - log(theta_c)) / beta_c;
+        p_fail_comm(i) = 0.5 * (1 + erf(z / sqrt(2)));
+        p_fail_comm(i) = min(max(p_fail_comm(i), 0), 0.999);
+    end
+end
+
+flood_scenario.p_fail_power = p_fail_power;
+flood_scenario.p_fail_comm  = p_fail_comm;
+
+%% ---------------- 5. 蒙特卡洛生成故障场景集 ----------------
+num_scenarios = 10000;
+flood_scenario.num_scenarios = num_scenarios;
+
+base_road_blocked = road_blocked;
+max_fault_nodes_power = 10;
+max_fault_roads       = 4;
+max_fault_base_stations = min(10, comm_net.n_base_stations);
+
+scenarios(num_scenarios) = struct( ...
+    'damaged_nodes_power', [], ...
+    'damaged_base_stations', [], ...
+    'road_blocked', [], ...
+    'lost_load_MW', 0, ...
+    'n_fault_nodes', 0, ...
+    'n_fault_roads', 0, ...
+    'n_fault_bs', 0);
+
+PL_kW = power_net.PL_kW;
+
+for s = 1:num_scenarios
+    damaged_nodes_power = rand(N, 1) < p_fail_power;
+    damaged_nodes_power(1) = false;
+
+    damaged_bs = false(N, 1);
+    bs_nodes = comm_net.base_station_nodes(:);
+    n_bs = numel(bs_nodes);
+    p_fail_bs = p_fail_comm(bs_nodes);
+
+    bs_fail_flags = rand(n_bs, 1) < p_fail_bs;
+    n_fail = sum(bs_fail_flags);
+
+    min_bs = 5;
+    max_bs = 10;
+    min_bs = min(min_bs, n_bs);
+    max_bs = min(max_bs, n_bs);
+
+    if n_fail < min_bs
+        remaining = find(~bs_fail_flags);
+        if ~isempty(remaining)
+            [~, sort_idx] = sort(p_fail_bs(remaining), 'descend');
+            need = min(min_bs - n_fail, numel(remaining));
+            add_idx = remaining(sort_idx(1:need));
+            bs_fail_flags(add_idx) = true;
+        end
+    elseif n_fail > max_bs
+        fail_list = find(bs_fail_flags);
+        [~, sort_idx] = sort(p_fail_bs(fail_list), 'descend');
+        keep = fail_list(sort_idx(1:max_bs));
+        new_flags = false(size(bs_fail_flags));
+        new_flags(keep) = true;
+        bs_fail_flags = new_flags;
+    end
+
+    damaged_bs(:) = false;
+    damaged_bs(bs_nodes(bs_fail_flags)) = true;
+
+    road_blocked_s = base_road_blocked;
+    lost_load_MW = sum(PL_kW(damaged_nodes_power)) / 1000;
+
+    scenarios(s).damaged_nodes_power   = damaged_nodes_power;
+    scenarios(s).damaged_base_stations = damaged_bs;
+    scenarios(s).road_blocked          = road_blocked_s;
+    scenarios(s).lost_load_MW          = lost_load_MW;
+    scenarios(s).n_fault_nodes         = sum(damaged_nodes_power);
+    scenarios(s).n_fault_roads         = sum(road_blocked_s);
+    scenarios(s).n_fault_bs            = sum(damaged_bs);
+end
+
+flood_scenario.scenarios = scenarios;
+
+%% ---------------- 6. 筛选"最恶劣场景" ----------------
+n_fault_nodes  = arrayfun(@(x)x.n_fault_nodes, scenarios);
+n_fault_roads  = arrayfun(@(x)x.n_fault_roads, scenarios);
+n_fault_bs     = arrayfun(@(x)x.n_fault_bs, scenarios);
+lost_load      = arrayfun(@(x)x.lost_load_MW, scenarios);
+
+valid_idx = find( ...
+    n_fault_nodes <= max_fault_nodes_power & ...
+    n_fault_roads <= max_fault_roads & ...
+    n_fault_bs    <= max_fault_base_stations);
+
+if isempty(valid_idx)
+    [~, worst_idx] = max(lost_load);
+else
+    [~, local] = max(lost_load(valid_idx));
+    worst_idx = valid_idx(local);
+end
+
+flood_scenario.worst_index = worst_idx;
+worst_scenario = scenarios(worst_idx);
+
+%% ---------------- 7. 更新 params & damaged_status ----------------
+node_damaged = worst_scenario.damaged_nodes_power;
+Fset = find(node_damaged);
+params.Fset = Fset(:).';
+params.F = length(Fset);
+
+n_zones = flood_scenario.n_flood_zones;
+zone_near_nodes = zeros(n_zones, 1);
+for z = 1:n_zones
+    center = flood_scenario.centers(z, :);
+    dist = vecnorm(coords - center, 2, 2);
+    [~, idx_min] = min(dist);
+    zone_near_nodes(z) = idx_min;
+end
+params.Wstart = unique(zone_near_nodes);
+
+[~, depth_sorted_idx] = sort(node_water_depth, 'ascend');
+n_wend = min(length(params.Wstart), 3);
+params.Wend = depth_sorted_idx(1:n_wend);
+
+%% damaged_status 填充
+damaged_status = struct();
+damaged_status.node_damaged = node_damaged;
+damaged_status.road_water_depth = road_water_depth;
+damaged_status.road_blocked = road_blocked;
+
+v0 = 28.8;
+a_wd = 0.2;
+b_wd = 1.5;
+
+rng(42);
+random_depth = 0.25 * rand(n_roads, 1);
+effective_depth = max(road_water_depth, random_depth);
+% 计算基础行程速度
+v_travel = v0/2 * (1 + tanh((a_wd - effective_depth) ./ b_wd));
+v_travel = max(v_travel, 5);
+
+edge_length_km = traffic_net.edge_length_km;
+t_travel_edge = edge_length_km ./ v_travel;
+
+% 阻断道路增加1小时通行时间（简化的道路排水模型）
+road_drainage_time = 1.0;  % 道路排水时间，单位：小时
+t_travel_edge(road_blocked) = t_travel_edge(road_blocked) + road_drainage_time;
+
+traffic_net.G.Edges.Weight = t_travel_edge;
+damaged_status.Ttravel = distances(traffic_net.G);
+damaged_status.t_travel_edge = t_travel_edge;
+damaged_status.v_travel = v_travel;
+damaged_status.road_drainage_time = road_drainage_time;
+damaged_status.road_blocked_extra_time = zeros(n_roads, 1);
+damaged_status.road_blocked_extra_time(road_blocked) = road_drainage_time;
+damaged_status.road_repair_time = zeros(n_roads, 1);
+damaged_status.road_repair_time(road_blocked) = 2.0;
+damaged_status.road_target_depth = road_water_depth;
+damaged_status.road_target_depth(road_blocked) = 0.1;
+
+damaged_status.Wneed = zeros(1, params.F);
+for k = 1:params.F
+    i = Fset(k);
+    base_volume = 1000;
+    depth_volume = node_water_depth(i) * 500;
+    damaged_status.Wneed(k) = base_volume + depth_volume;
+end
+
+damaged_status.line_damaged = false(params.L, 1);
+for l = 1:params.L
+    i = power_net.line_from(l);
+    j = power_net.line_to(l);
+    if node_damaged(i) || node_damaged(j)
+        damaged_status.line_damaged(l) = true;
+    end
+end
+
+damaged_bs = worst_scenario.damaged_base_stations;
+damaged_status.damaged_base_stations = find(damaged_bs);
+
+fprintf('  洪泛区数量: %d\n', flood_scenario.n_flood_zones);
+fprintf('  节点最大水深: %.2f m\n', max(node_water_depth));
+fprintf('  最恶劣场景: 失负荷 = %.2f MW, 故障节点 = %d, 阻断道路 = %d, 基站损坏 = %d\n', ...
+    worst_scenario.lost_load_MW, ...
+    worst_scenario.n_fault_nodes, ...
+    worst_scenario.n_fault_roads, ...
+    worst_scenario.n_fault_bs);
+
+%% ---------------- 8. 场景缩减 ----------------
+n_selected = 20;
+
+[selected_idx, scenario_prob, cluster_info] = scenario_reduction_v2(...
+    scenarios, n_selected, PL_kW, power_net, comm_net);
+
+flood_scenario.selected_scenarios = scenarios(selected_idx);
+flood_scenario.selected_idx = selected_idx;
+flood_scenario.n_selected = n_selected;
+flood_scenario.scenario_prob = scenario_prob;
+flood_scenario.cluster_info = cluster_info;
+
+fprintf('  随机规划场景数: %d (从%d个中选取)\n', n_selected, num_scenarios);
+fprintf('  场景概率范围: [%.4f, %.4f]\n', min(scenario_prob), max(scenario_prob));
+end
+
+function [selected_idx, scenario_prob, cluster_info] = scenario_reduction_v2(...
+    scenarios, n_select, PL_kW, power_net, comm_net)
+%% 场景缩减算法
+
+num_scenarios = length(scenarios);
+N = length(PL_kW);
+
+%% 构建场景特征矩阵
+feature_matrix = zeros(num_scenarios, 4);
+
+for s = 1:num_scenarios
+    feature_matrix(s, 1) = scenarios(s).lost_load_MW / (sum(PL_kW)/1000);
+    feature_matrix(s, 2) = scenarios(s).n_fault_nodes / N;
+    feature_matrix(s, 3) = scenarios(s).n_fault_roads / length(scenarios(s).road_blocked);
+    feature_matrix(s, 4) = scenarios(s).n_fault_bs / comm_net.n_base_stations;
+end
+
+feature_mean = mean(feature_matrix, 1);
+feature_std = std(feature_matrix, 0, 1);
+feature_std(feature_std < 1e-10) = 1;
+feature_normalized = (feature_matrix - feature_mean) ./ feature_std;
+
+%% K-means 聚类
+opts = statset('MaxIter', 500);
+[cluster_idx, centroids] = kmeans(feature_normalized, n_select, ...
+    'Replicates', 5, 'Options', opts, 'Distance', 'sqeuclidean');
+
+cluster_sizes = histcounts(cluster_idx, 1:(n_select+1));
+scenario_prob = cluster_sizes(:) / num_scenarios;
+
+selected_idx = zeros(n_select, 1);
+lost_load_all = arrayfun(@(x) x.lost_load_MW, scenarios);
+
+for k = 1:n_select
+    members = find(cluster_idx == k);
+    if isempty(members)
+        dists = vecnorm(feature_normalized - centroids(k,:), 2, 2);
+        [~, selected_idx(k)] = min(dists);
+    else
+        member_features = feature_normalized(members, :);
+        dists = vecnorm(member_features - centroids(k,:), 2, 2);
+        [~, local_idx] = min(dists);
+        selected_idx(k) = members(local_idx);
+    end
+end
+
+lost_load_all = arrayfun(@(x) x.lost_load_MW, scenarios);
+[~, worst_idx] = max(lost_load_all);
+if ~ismember(worst_idx, selected_idx)
+    [~, min_prob_idx] = min(scenario_prob);
+    selected_idx(min_prob_idx) = worst_idx;
+end
+
+cluster_info.cluster_idx = cluster_idx;
+cluster_info.centroids = centroids;
+cluster_info.cluster_sizes = cluster_sizes;
+cluster_info.feature_matrix = feature_matrix;
+end
+function [power_net, traffic_net, comm_net, params] = init_coupled_networks_v2()
+%% Initialize IEEE 33-bus Power-Traffic-Communication Coupled Network (V2)
+%% ========================================================================
+%% 改进: 
+%%   - 完整的邻接矩阵定义
+%%   - 支持单商品流约束所需的数据结构
+%%   - 清晰的网络拓扑定义
+%% ========================================================================
+
+%% System base parameters
+params.N   = 33;            % Number of nodes
+params.L   = 32;            % Number of lines
+params.SB  = 10;            % Base capacity (MVA)
+params.VB  = 12.66;         % Base voltage (kV)
+params.T   = 30;            % Recovery time horizon (periods)
+params.Dt  = 1;             % Time step (hours)
+params.MBig = 1000;         % Big-M constant
+
+% Fault parameters will be set by generate_flood_scenario
+params.Fset  = [];
+params.F     = 0;
+params.Wstart = [];
+params.Wend   = [];
+
+%% IEEE 33-bus load data [Node, P(kW), Q(kVar), Weight]
+bus_data = [
+    1,   0,    0,    0;
+    2,   100,  60,   1.0;
+    3,   90,   40,   1.0;
+    4,   120,  80,   1.2;
+    5,   60,   30,   1.0;
+    6,   60,   20,   1.0;
+    7,   200,  100,  1.5;
+    8,   200,  100,  1.5;
+    9,   60,   20,   1.0;
+    10,  60,   20,   1.0;
+    11,  45,   30,   0.8;
+    12,  60,   35,   1.0;
+    13,  60,   35,   1.0;
+    14,  120,  80,   1.2;
+    15,  60,   10,   1.0;
+    16,  60,   20,   1.0;
+    17,  60,   20,   1.0;
+    18,  90,   40,   1.0;
+    19,  90,   40,   1.0;
+    20,  90,   40,   1.0;
+    21,  90,   40,   1.0;
+    22,  90,   40,   1.0;
+    23,  90,   50,   1.0;
+    24,  420,  200,  2.0;
+    25,  420,  200,  2.0;
+    26,  60,   25,   1.0;
+    27,  60,   25,   1.0;
+    28,  60,   20,   1.0;
+    29,  120,  70,   1.2;
+    30,  200,  600,  1.5;
+    31,  150,  70,   1.2;
+    32,  210,  100,  1.5;
+    33,  60,   40,   1.0;
+];
+
+params.PL_kW     = bus_data(:, 2);
+params.QL_kVar   = bus_data(:, 3);
+params.bus_weight = bus_data(:, 4);
+
+% Branch data [From, To, R(ohm), X(ohm)]
+branch_data = [
+    1,2,0.0922,0.0470; 2,3,0.4930,0.2511; 3,4,0.3660,0.1864; 4,5,0.3811,0.1941;
+    5,6,0.8190,0.7070; 6,7,0.1872,0.6188; 7,8,0.7114,0.2351; 8,9,1.0300,0.7400;
+    9,10,1.0440,0.7400; 10,11,0.1966,0.0650; 11,12,0.3744,0.1238; 12,13,1.4680,1.1550;
+    13,14,0.5416,0.7129; 14,15,0.5910,0.5260; 15,16,0.7463,0.5450; 16,17,1.2890,1.7210;
+    17,18,0.7320,0.5740; 2,19,0.1640,0.1565; 19,20,1.5042,1.3554; 20,21,0.4095,0.4784;
+    21,22,0.7089,0.9373; 3,23,0.4512,0.3083; 23,24,0.8980,0.7091; 24,25,0.8960,0.7011;
+    6,26,0.2030,0.1034; 26,27,0.2842,0.1447; 27,28,1.0590,0.9337; 28,29,0.8042,0.7006;
+    29,30,0.5075,0.2585; 30,31,0.9744,0.9630; 31,32,0.3105,0.3619; 32,33,0.3410,0.5302;
+];
+
+%% Build power network
+power_net.n_nodes     = params.N;
+power_net.n_lines     = params.L;
+power_net.PL_kW       = bus_data(:, 2);
+power_net.QL_kVar     = bus_data(:, 3);
+power_net.bus_weight  = bus_data(:, 4);
+power_net.PL          = bus_data(:, 2) / 1000 / params.SB;
+power_net.QL          = bus_data(:, 3) / 1000 / params.SB;
+power_net.total_load_MW = sum(power_net.PL_kW) / 1000;
+
+power_net.line_from   = branch_data(:, 1);
+power_net.line_to     = branch_data(:, 2);
+power_net.Rbr         = branch_data(:, 3);
+power_net.Xbr         = branch_data(:, 4);
+
+power_net.Smax        = 5 * ones(params.L, 1) / params.SB;
+power_net.PGmax       = zeros(params.N, 1);
+power_net.PGmax(1)    = 11 / params.SB;
+power_net.QGmax       = 9 * ones(params.N, 1) / params.SB;
+
+power_net.Vmin2       = 0.8^2;
+power_net.Vmax2       = 1.2^2;
+
+power_net.coords      = generate_node_coordinates();
+
+%% 关键：构建完整的邻接矩阵
+power_net.adj = zeros(params.N);
+for l = 1:params.L
+    i = power_net.line_from(l);
+    j = power_net.line_to(l);
+    power_net.adj(i, j) = 1;
+    power_net.adj(j, i) = 1;
+end
+
+%% 构建父节点映射（用于辐射状网络拓扑）
+% IEEE 33母线是辐射状网络，节点1为根节点
+power_net.root = 1;
+power_net.parent = zeros(params.N, 1);
+power_net.children = cell(params.N, 1);
+
+% 使用BFS构建树结构
+visited = false(params.N, 1);
+queue = [1];
+visited(1) = true;
+power_net.parent(1) = 0;  % 根节点没有父节点
+
+while ~isempty(queue)
+    current = queue(1);
+    queue(1) = [];
+    neighbors = find(power_net.adj(current, :));
+    for nb = neighbors
+        if ~visited(nb)
+            visited(nb) = true;
+            power_net.parent(nb) = current;
+            power_net.children{current} = [power_net.children{current}, nb];
+            queue = [queue, nb];
+        end
+    end
+end
+
+%% 构建线路映射
+power_net.line_idx = zeros(params.N, params.N);  % line_idx(i,j) = 线路编号
+for l = 1:params.L
+    i = power_net.line_from(l);
+    j = power_net.line_to(l);
+    power_net.line_idx(i, j) = l;
+    power_net.line_idx(j, i) = l;
+end
+
+% Node-line incidence
+power_net.OUT = cell(params.N, 1);
+power_net.IN  = cell(params.N, 1);
+for l = 1:params.L
+    i = power_net.line_from(l);
+    j = power_net.line_to(l);
+    power_net.OUT{i} = [power_net.OUT{i}, l];
+    power_net.IN{j}  = [power_net.IN{j},  l];
+end
+
+%% 同步到params
+params.coords = power_net.coords;
+params.adj = power_net.adj;
+
+%% Build traffic network (same topology as power + tie lines)
+traffic_net.n_nodes = params.N;
+traffic_net.coords  = power_net.coords;
+
+edges = [power_net.line_from, power_net.line_to];
+tie_lines = [8, 21; 9, 15; 12, 22; 18, 33; 25, 29];
+edges = [edges; tie_lines];
+
+traffic_net.edges      = edges;
+traffic_net.n_roads    = size(edges, 1);
+traffic_net.from_node  = edges(:, 1);
+traffic_net.to_node    = edges(:, 2);
+
+traffic_net.G = graph(edges(:, 1), edges(:, 2));
+traffic_net.edge_length_km = 2;
+
+traffic_net.adj = zeros(params.N);
+for e = 1:traffic_net.n_roads
+    i = edges(e, 1);
+    j = edges(e, 2);
+    traffic_net.adj(i, j) = 1;
+    traffic_net.adj(j, i) = 1;
+end
+
+traffic_net.warehouse_candidates = [];
+
+%% Build communication network - 修改部分
+comm_net.n_nodes = params.N;
+comm_net.coords  = power_net.coords;
+comm_net.root    = 1;  % 控制中心位于节点1
+comm_net.adj     = power_net.adj;
+
+comm_net.base_station_nodes = [2, 6, 10, 14, 18, 22, 26, 30];
+comm_net.n_base_stations    = length(comm_net.base_station_nodes);
+comm_net.damaged_stations   = [];
+
+%% ====== 新增：基于距离的通信覆盖模型 ======
+% 计算节点间欧氏距离矩阵
+coords = power_net.coords;
+N = params.N;
+comm_net.node_distance_km = zeros(N, N);
+for i = 1:N
+    for j = 1:N
+        % 坐标已归一化到10x10，每单位约等于1km
+        comm_net.node_distance_km(i,j) = norm(coords(i,:) - coords(j,:));
+    end
+end
+
+% 通信参数
+comm_net.uav_transmission_range_km = 15;   % 无人机回传距离15km
+comm_net.mcv_coverage_range_km = 2;        % MCV覆盖半径2km
+comm_net.bs_mutual_range_km = 2;           % 基站间互联距离（最近两个基站能互相通信）
+comm_net.node_spacing_km = 1;              % 节点间道路长度1km
+
+% 计算基站间的连通性（基站间距离小于bs_mutual_range则可互联）
+n_bs = comm_net.n_base_stations;
+bs_nodes = comm_net.base_station_nodes;
+comm_net.bs_connectivity = zeros(n_bs, n_bs);
+for i = 1:n_bs
+    for j = 1:n_bs
+        if i ~= j
+            dist = comm_net.node_distance_km(bs_nodes(i), bs_nodes(j));
+            if dist <= comm_net.bs_mutual_range_km
+                comm_net.bs_connectivity(i,j) = 1;
+            end
+        end
+    end
+end
+comm_net.FTU_nodes = unique([power_net.line_from; power_net.line_to]);
+
+%% 同步到params
+params.coords = power_net.coords;
+params.adj = power_net.adj;
+params.node_distance_km = comm_net.node_distance_km;
+
+end
+
+function A_cov = compute_coverage_matrix(N, edges, r_hop)
+A = zeros(N);
+for e = 1:size(edges, 1)
+    i = edges(e, 1);
+    j = edges(e, 2);
+    A(i, j) = 1;
+    A(j, i) = 1;
+end
+
+I = eye(N);
+if r_hop == 0
+    A_cov = I;
+elseif r_hop == 1
+    A_cov = double((A + I) > 0);
+else
+    Reach = I;
+    Ak = I;
+    for k = 1:r_hop
+        Ak = Ak * A;
+        Reach = Reach | (Ak > 0);
+    end
+    A_cov = double(Reach);
+end
+end
+
+function coords = generate_node_coordinates()
+coords = zeros(33, 2);
+
+% Main feeder 1-2-...-18
+for i = 1:18
+    coords(i, :) = [(i-1) * 1.5, 0];
+end
+
+% Branch 2-19-20-21-22
+branch1 = [19, 20, 21, 22];
+for i = 1:4
+    coords(branch1(i), :) = coords(2, :) + [i * 1.2, -2];
+end
+
+% Branch 3-23-24-25
+branch2 = [23, 24, 25];
+for i = 1:3
+    coords(branch2(i), :) = coords(3, :) + [i * 1.2, 2.5];
+end
+
+% Branch 6-26-27-28-29-30-31-32-33
+branch3 = [26, 27, 28, 29, 30, 31, 32, 33];
+for i = 1:8
+    coords(branch3(i), :) = coords(6, :) + [0.8 * i, -3 - 0.3 * i];
+end
+
+% Normalize
+coords(:, 1) = coords(:, 1) - min(coords(:, 1));
+coords(:, 2) = coords(:, 2) - min(coords(:, 2));
+coords = coords / max(max(coords)) * 10;
+end
