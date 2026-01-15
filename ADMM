@@ -1,1 +1,2054 @@
+function [result, admm_info] = ADMM_solve_v3(power_net, traffic_net, comm_net, damaged_status, resources, deployment, schedule, params, config)
+%% ADMM分布式优化求解器 V3
+%% 与V2相同，仅确保接口兼容
 
+N = params.N; T = params.T; F = params.F; Fset = params.Fset; Dt = params.Dt;
+if ~isfield(comm_net, 'adj'), comm_net.adj = power_net.adj; end
+
+admm_params.max_iter = 50;
+admm_params.rho_init = 1.0;
+admm_params.rho_min = 0.01;
+admm_params.rho_max = 100;
+admm_params.tau_incr = 2.0;
+admm_params.tau_decr = 2.0;
+admm_params.mu = 10;
+admm_params.eps_abs = 1e-4;
+admm_params.eps_rel = 1e-3;
+slack_penalty = 1000;
+
+% 初始化全局变量
+z = struct();
+z.Xenerg = zeros(N, T);
+z.C_comm = zeros(N, T);
+z.T_drain = schedule.drain_complete_time;
+z.T_repair = schedule.repair_complete_time;
+z.T_mes_arrival = schedule.mes_arrival_time;
+
+% 初始化对偶变量
+u = struct();
+u.power_Xenerg = zeros(N, T);
+u.power_Ccomm = zeros(N, T);
+u.power_Tdrain = zeros(F, 1);
+u.power_Trepair = zeros(F, 1);
+u.power_Tmes = zeros(resources.n_mes, 1);
+u.comm_Xenerg = zeros(N, T);
+u.comm_Ccomm = zeros(N, T);
+u.traffic_Tdrain = zeros(F, 1);
+u.traffic_Trepair = zeros(F, 1);
+u.traffic_Tmes = zeros(resources.n_mes, 1);
+
+% 初始化子问题变量
+x_power = init_power_vars(N, T, F, resources);
+x_comm = init_comm_vars(N, T);
+x_traffic = init_traffic_vars(F, resources, schedule);
+
+% 交通子问题的调度信息
+traffic_solution = struct();
+traffic_solution.drain_complete_time = schedule.drain_complete_time;
+traffic_solution.repair_complete_time = schedule.repair_complete_time;
+traffic_solution.mes_arrival_time = schedule.mes_arrival_time;
+traffic_solution.MES_sequence = schedule.MES_sequence;
+traffic_solution.MES_arrival_times = schedule.MES_arrival_times;
+traffic_solution.MES_service_durations = schedule.MES_service_durations;
+traffic_solution.uav_task_sequence = schedule.uav_task_sequence;
+traffic_solution.uav_task_arrival = schedule.uav_task_arrival;
+traffic_solution.mcv_task_sequence = schedule.mcv_task_sequence;
+traffic_solution.mcv_task_arrival = schedule.mcv_task_arrival;
+traffic_solution.uav_task_stays = schedule.uav_task_stays;  % 添加这行
+% ADMM信息记录
+admm_info = struct();
+admm_info.primal_res = zeros(admm_params.max_iter, 1);
+admm_info.dual_res = zeros(admm_params.max_iter, 1);
+admm_info.objective = zeros(admm_params.max_iter, 1);
+admm_info.rho_history = zeros(admm_params.max_iter, 1);
+
+rho = admm_params.rho_init;
+z_old = z;
+
+for k = 1:admm_params.max_iter
+    % 交通子问题
+    [x_traffic, ~] = solve_traffic_subproblem(x_traffic, z, u, damaged_status, resources, params, deployment, rho);
+    traffic_solution.drain_complete_time = x_traffic.drain_complete;
+    traffic_solution.repair_complete_time = x_traffic.repair_complete;
+    
+    % 通信子问题
+    [x_comm, ~] = solve_comm_subproblem(x_comm, z, u, comm_net, power_net, resources, params, config, deployment, traffic_solution, rho);
+    
+    % 电力子问题
+    [x_power, ~] = solve_power_subproblem(x_power, z, u, power_net, resources, params, config, deployment, traffic_solution, rho, slack_penalty);
+    
+    % 更新全局变量
+    z_old = z;
+    z.Xenerg = max(0, min(1, 0.5*(x_power.Xenerg + u.power_Xenerg) + 0.5*(x_comm.Xenerg_expected + u.comm_Xenerg)));
+    z.C_comm = max(0, min(1, 0.5*(x_comm.C_comm + u.comm_Ccomm) + 0.5*(x_power.C_comm_used + u.power_Ccomm)));
+    z.T_drain = 0.5*(x_traffic.drain_complete + u.traffic_Tdrain) + 0.5*(x_power.T_drain_used + u.power_Tdrain);
+    z.T_repair = 0.5*(x_traffic.repair_complete + u.traffic_Trepair) + 0.5*(x_power.T_repair_used + u.power_Trepair);
+    
+    % 更新对偶变量
+    u.power_Xenerg = u.power_Xenerg + (x_power.Xenerg - z.Xenerg);
+    u.power_Ccomm = u.power_Ccomm + (x_power.C_comm_used - z.C_comm);
+    u.power_Tdrain = u.power_Tdrain + (x_power.T_drain_used - z.T_drain);
+    u.power_Trepair = u.power_Trepair + (x_power.T_repair_used - z.T_repair);
+    u.comm_Xenerg = u.comm_Xenerg + (x_comm.Xenerg_expected - z.Xenerg);
+    u.comm_Ccomm = u.comm_Ccomm + (x_comm.C_comm - z.C_comm);
+    u.traffic_Tdrain = u.traffic_Tdrain + (x_traffic.drain_complete - z.T_drain);
+    u.traffic_Trepair = u.traffic_Trepair + (x_traffic.repair_complete - z.T_repair);
+    
+    % 计算残差
+    r_primal = norm(x_power.Xenerg - z.Xenerg, 'fro') + norm(x_comm.C_comm - z.C_comm, 'fro') + ...
+        norm(x_traffic.drain_complete - z.T_drain) + norm(x_traffic.repair_complete - z.T_repair);
+    s_dual = rho * (norm(z.Xenerg - z_old.Xenerg, 'fro') + norm(z.C_comm - z_old.C_comm, 'fro') + ...
+        norm(z.T_drain - z_old.T_drain) + norm(z.T_repair - z_old.T_repair));
+    
+    PL_MW = power_net.PL_kW / 1000;
+    current_recovery = sum(PL_MW' * x_power.Xload) / (sum(PL_MW) * T);
+    
+    admm_info.primal_res(k) = r_primal;
+    admm_info.dual_res(k) = s_dual;
+    admm_info.objective(k) = current_recovery;
+    admm_info.rho_history(k) = rho;
+    
+    % 自适应rho
+    if r_primal > admm_params.mu * s_dual
+        rho = min(rho * admm_params.tau_incr, admm_params.rho_max);
+        u = rescale_dual_vars(u, 1/admm_params.tau_incr);
+    elseif s_dual > admm_params.mu * r_primal
+        rho = max(rho / admm_params.tau_decr, admm_params.rho_min);
+        u = rescale_dual_vars(u, admm_params.tau_decr);
+    end
+    
+    % 收敛检查
+    n_vars = N*T + N*T + F + F;
+    eps_pri = sqrt(n_vars) * admm_params.eps_abs + admm_params.eps_rel * max(norm(z.Xenerg(:)), norm(x_power.Xenerg(:)));
+    eps_dual = sqrt(n_vars) * admm_params.eps_abs + admm_params.eps_rel * rho * norm(u.power_Xenerg(:));
+    
+    if r_primal < eps_pri && s_dual < eps_dual
+        admm_info.converged = true;
+        admm_info.converged_iter = k;
+        break;
+    end
+end
+
+if k == admm_params.max_iter
+    admm_info.converged = false;
+    admm_info.converged_iter = k;
+end
+
+% 二值化结果
+x_power.Xenerg = double(x_power.Xenerg > 0.5);
+x_power.Xload = double(x_power.Xload > 0.5);
+
+% 组装结果
+result = assemble_result(x_power, x_comm, x_traffic, z, power_net, params);
+admm_info.final_rho = rho;
+end
+
+%% 辅助函数
+function x_power = init_power_vars(N, T, F, resources)
+x_power = struct();
+x_power.Xenerg = zeros(N, T);
+x_power.Xgrid = zeros(N, T);
+x_power.Xmesenerg = zeros(N, T);
+x_power.Xdgenerg = zeros(N, T);
+x_power.Xload = zeros(N, T);
+x_power.C_comm_used = zeros(N, T);
+x_power.T_drain_used = inf(F, 1);
+x_power.T_repair_used = inf(F, 1);
+x_power.T_mes_used = zeros(resources.n_mes, 1);
+end
+
+function x_comm = init_comm_vars(N, T)
+x_comm = struct();
+x_comm.C_comm = zeros(N, T);
+x_comm.Raw_cov = zeros(N, T);
+x_comm.Xenerg_expected = zeros(N, T);
+end
+
+function x_traffic = init_traffic_vars(F, resources, schedule)
+x_traffic = struct();
+x_traffic.drain_complete = schedule.drain_complete_time;
+x_traffic.repair_complete = schedule.repair_complete_time;
+if isfield(schedule, 'mes_arrival_time') && ~isempty(schedule.mes_arrival_time)
+    x_traffic.T_arrival_mes = schedule.mes_arrival_time;
+else
+    x_traffic.T_arrival_mes = zeros(resources.n_mes, 1);
+end
+end
+
+function u = rescale_dual_vars(u, scale)
+u.power_Xenerg = u.power_Xenerg * scale;
+u.power_Ccomm = u.power_Ccomm * scale;
+u.power_Tdrain = u.power_Tdrain * scale;
+u.power_Trepair = u.power_Trepair * scale;
+u.power_Tmes = u.power_Tmes * scale;
+u.comm_Xenerg = u.comm_Xenerg * scale;
+u.comm_Ccomm = u.comm_Ccomm * scale;
+u.traffic_Tdrain = u.traffic_Tdrain * scale;
+u.traffic_Trepair = u.traffic_Trepair * scale;
+u.traffic_Tmes = u.traffic_Tmes * scale;
+end
+
+function [x_traffic, obj] = solve_traffic_subproblem(x_traffic, z, u, damaged_status, resources, params, deployment, rho)
+%% 交通子问题目标函数 (公式62)
+%% F^tra = Σ ω_f · t_f^repair + C^drain + C^repair + Γ^tra
+
+F = params.F;
+Fset = params.Fset;
+
+if isfield(damaged_status, 'Ttravel')
+    Ttravel = damaged_status.Ttravel;
+else
+    N = params.N;
+    Ttravel = ones(N, N) * 0.5;
+end
+
+% 保持原有的时间计算逻辑
+x_traffic.drain_complete = z.T_drain;
+x_traffic.repair_complete = z.T_repair;
+
+n_mes = resources.n_mes;
+if ~isempty(deployment.mes_target)
+    x_traffic.T_arrival_mes = zeros(n_mes, 1);
+    for m = 1:min(n_mes, length(deployment.mes_target))
+        if m <= length(deployment.mes_warehouse)
+            start_pos = deployment.mes_warehouse(m);
+        else
+            start_pos = deployment.mes_warehouse(1);
+        end
+        target_pos = deployment.mes_target(m);
+        x_traffic.T_arrival_mes(m) = Ttravel(start_pos, target_pos);
+    end
+else
+    x_traffic.T_arrival_mes = zeros(n_mes, 1);
+end
+
+%% ========== 目标函数计算 (公式62) ==========
+
+%% 1. 加权维修完成时间 Σ ω_f · t_f^repair
+weighted_repair_time = 0;
+for f = 1:F
+    if x_traffic.repair_complete(f) < inf
+        node = Fset(f);
+        omega_f = params.bus_weight(node) * params.PL_kW(node) / 1000;  % 故障优先权重
+        weighted_repair_time = weighted_repair_time + omega_f * x_traffic.repair_complete(f);
+    end
+end
+
+%% 2. 排水队运行成本 C^drain = Σ c_p^drain · T_p^work
+C_drain = 0;
+for f = 1:F
+    if x_traffic.drain_complete(f) < inf
+        % 排水工作时长 = 完成时间 - 到达时间 (简化为完成时间的一部分)
+        T_work_drain = max(0, x_traffic.drain_complete(f) - 1.0);  % 减去行程时间估计
+        C_drain = C_drain + resources.c_drain * T_work_drain / resources.n_drainage;
+    end
+end
+
+%% 3. 维修队运行成本 C^repair = Σ c_g^repair · T_g^work  
+C_repair = 0;
+for f = 1:F
+    if x_traffic.repair_complete(f) < inf
+        % 维修工作时长
+        T_work_repair = resources.Tsingle(f);  % 单次维修时间
+        C_repair = C_repair + resources.c_repair * T_work_repair;
+    end
+end
+
+%% 4. 交通子问题原始目标
+obj_original = weighted_repair_time + C_drain + C_repair;
+
+%% 5. ADMM增广拉格朗日惩罚项 Γ^tra
+% 共识变量: t^drain, t^repair, t^MES,arrive, t^road
+penalty_Gamma_tra = (rho/2) * norm(x_traffic.drain_complete - z.T_drain + u.traffic_Tdrain)^2 + ...
+                    (rho/2) * norm(x_traffic.repair_complete - z.T_repair + u.traffic_Trepair)^2;
+
+%% 6. 总目标
+obj = obj_original + penalty_Gamma_tra;
+
+%% 保存成本分解
+x_traffic.cost_breakdown.weighted_repair_time = weighted_repair_time;
+x_traffic.cost_breakdown.C_drain = C_drain;
+x_traffic.cost_breakdown.C_repair = C_repair;
+x_traffic.cost_breakdown.obj_original = obj_original;
+
+end
+
+function [x_comm, obj] = solve_comm_subproblem(x_comm, z, u, comm_net, power_net, resources, params, config, deployment, traffic_solution, rho)
+%% 通信子问题求解 - V3重写版
+%% 基于15km回传距离的通信覆盖模型
+%% 支持无人机自组网中继
+
+N = params.N; 
+T = params.T; 
+Dt = params.Dt;
+Fset = params.Fset;
+F = params.F;
+
+% 获取节点坐标和距离矩阵
+coords = power_net.coords;
+if isfield(comm_net, 'node_distance_km')
+    dist_matrix = comm_net.node_distance_km;
+else
+    % 计算距离矩阵
+    dist_matrix = zeros(N, N);
+    for i = 1:N
+        for j = 1:N
+            dist_matrix(i,j) = norm(coords(i,:) - coords(j,:));
+        end
+    end
+end
+
+% 通信参数
+uav_range_km = resources.uav_transmission_range_km;  % 15km
+mcv_range_km = resources.mcv_coverage_range_km;      % 2km
+control_center = comm_net.root;  % 控制中心节点（通常为节点1）
+
+% 获取基站状态
+bs_nodes = comm_net.base_station_nodes;
+if isfield(comm_net, 'damaged_stations')
+    damaged_bs = comm_net.damaged_stations;
+else
+    damaged_bs = [];
+end
+
+% 获取维修完成时间
+repair_complete_time = traffic_solution.repair_complete_time;
+
+% 初始化输出
+C_comm = zeros(N, T);      % 通信连通状态
+Raw_cov = zeros(N, T);     % 原始覆盖状态
+Xenerg_input = z.Xenerg;   % 电力状态输入
+
+% 获取UAV调度信息
+n_uav = length(deployment.uav_target);
+uav_positions = zeros(n_uav, T);  % 记录每个时刻UAV所在节点
+
+if config.use_uav && n_uav > 0
+    for u_idx = 1:n_uav
+        if u_idx > length(traffic_solution.uav_task_sequence)
+            continue;
+        end
+        sequence = traffic_solution.uav_task_sequence{u_idx};
+        arrivals = traffic_solution.uav_task_arrival{u_idx};
+        stays = traffic_solution.uav_task_stays{u_idx};
+        
+        if isempty(sequence)
+            continue;
+        end
+        
+        for t = 1:T
+            current_time = t * Dt;
+            current_pos = 0;
+            
+            for kk = 1:length(sequence)
+                if kk <= length(arrivals) && kk <= length(stays)
+                    task_start = arrivals(kk);
+                    task_end = task_start + stays(kk);
+                    if current_time >= task_start && current_time < task_end
+                        current_pos = sequence(kk);
+                        break;
+                    end
+                end
+            end
+            
+            uav_positions(u_idx, t) = current_pos;
+        end
+    end
+end
+
+% 获取MCV调度信息
+n_mcv = length(deployment.mcv_target);
+mcv_positions = zeros(n_mcv, T);
+
+if config.use_mcv && n_mcv > 0
+    for m_idx = 1:n_mcv
+        if m_idx > length(traffic_solution.mcv_task_sequence)
+            continue;
+        end
+        sequence = traffic_solution.mcv_task_sequence{m_idx};
+        arrivals = traffic_solution.mcv_task_arrival{m_idx};
+        
+        if isempty(sequence)
+            continue;
+        end
+        
+        for t = 1:T
+            current_time = t * Dt;
+            current_pos = 0;
+            
+            for kk = 1:length(sequence)
+                if kk <= length(arrivals) && current_time >= arrivals(kk)
+                    current_pos = sequence(kk);
+                end
+            end
+            
+            mcv_positions(m_idx, t) = current_pos;
+        end
+    end
+end
+
+%% 主循环：计算每个时刻的通信连通性
+for t = 1:T
+    current_time = t * Dt;
+    
+    %% 步骤1：确定正常工作的基站
+    % 基站正常工作条件：未损坏 且 有电
+    normal_bs_list = [];
+    for bs_idx = 1:length(bs_nodes)
+        bs = bs_nodes(bs_idx);
+        is_damaged = ismember(bs, damaged_bs);
+        has_power = Xenerg_input(bs, t) >= 0.5;
+        
+        if ~is_damaged && has_power
+            normal_bs_list = [normal_bs_list, bs];
+        end
+    end
+    
+    %% 步骤2：构建通信网络图（用于连通性判断）
+    % 节点类型：控制中心、正常基站、UAV位置、MCV位置、普通节点
+    
+    % 创建扩展图：包含所有实体
+    % 实体编号：1~N为物理节点，N+1~N+n_uav为UAV，N+n_uav+1~N+n_uav+n_mcv为MCV
+    n_entities = N + n_uav + n_mcv;
+    comm_graph = zeros(n_entities, n_entities);
+    
+    % 2.1 控制中心与正常基站的连接（通过有线网络，假设控制中心能连接所有正常基站）
+    for bs = normal_bs_list
+        comm_graph(control_center, bs) = 1;
+        comm_graph(bs, control_center) = 1;
+    end
+    
+    % 2.2 正常基站之间的连接（相邻基站可互联）
+    for i = 1:length(normal_bs_list)
+        for j = i+1:length(normal_bs_list)
+            bs_i = normal_bs_list(i);
+            bs_j = normal_bs_list(j);
+            if dist_matrix(bs_i, bs_j) <= comm_net.bs_mutual_range_km
+                comm_graph(bs_i, bs_j) = 1;
+                comm_graph(bs_j, bs_i) = 1;
+            end
+        end
+    end
+    
+    % 2.3 UAV的连接
+    active_uav_list = [];
+    for u_idx = 1:n_uav
+        uav_pos = uav_positions(u_idx, t);
+        if uav_pos > 0 && uav_pos <= N
+            uav_entity = N + u_idx;
+            active_uav_list = [active_uav_list, u_idx];
+            
+            % UAV到控制中心的直接连接
+            if dist_matrix(uav_pos, control_center) <= uav_range_km
+                comm_graph(uav_entity, control_center) = 1;
+                comm_graph(control_center, uav_entity) = 1;
+            end
+            
+            % UAV到正常基站的连接
+            for bs = normal_bs_list
+                if dist_matrix(uav_pos, bs) <= uav_range_km
+                    comm_graph(uav_entity, bs) = 1;
+                    comm_graph(bs, uav_entity) = 1;
+                end
+            end
+            
+            % UAV覆盖范围内的节点
+            for node = 1:N
+                if dist_matrix(uav_pos, node) <= uav_range_km
+                    comm_graph(uav_entity, node) = 1;
+                    comm_graph(node, uav_entity) = 1;
+                end
+            end
+        end
+    end
+    
+    % 2.4 UAV之间的自组网连接
+    for i = 1:length(active_uav_list)
+        for j = i+1:length(active_uav_list)
+            u_i = active_uav_list(i);
+            u_j = active_uav_list(j);
+            pos_i = uav_positions(u_i, t);
+            pos_j = uav_positions(u_j, t);
+            
+            if pos_i > 0 && pos_j > 0
+                if dist_matrix(pos_i, pos_j) <= resources.uav_to_uav_range_km
+                    comm_graph(N + u_i, N + u_j) = 1;
+                    comm_graph(N + u_j, N + u_i) = 1;
+                end
+            end
+        end
+    end
+    
+    % 2.5 MCV的连接
+    for m_idx = 1:n_mcv
+        mcv_pos = mcv_positions(m_idx, t);
+        if mcv_pos > 0 && mcv_pos <= N
+            mcv_entity = N + n_uav + m_idx;
+            
+            % MCV覆盖范围内的节点
+            for node = 1:N
+                if dist_matrix(mcv_pos, node) <= mcv_range_km
+                    comm_graph(mcv_entity, node) = 1;
+                    comm_graph(node, mcv_entity) = 1;
+                end
+            end
+            
+            % MCV到控制中心（通过其他网络，简化处理）
+            comm_graph(mcv_entity, control_center) = 1;
+            comm_graph(control_center, mcv_entity) = 1;
+        end
+    end
+    
+    %% 步骤3：使用BFS/DFS计算从控制中心可达的节点
+    reachable = false(n_entities, 1);
+    reachable(control_center) = true;
+    queue = [control_center];
+    
+    while ~isempty(queue)
+        current = queue(1);
+        queue(1) = [];
+        neighbors = find(comm_graph(current, :));
+        for nb = neighbors
+            if ~reachable(nb)
+                reachable(nb) = true;
+                queue = [queue, nb];
+            end
+        end
+    end
+    
+    %% 步骤4：提取物理节点的通信状态
+    node_comm_status = reachable(1:N);
+    
+    % 控制中心始终有通信
+    node_comm_status(control_center) = true;
+    
+    %% 步骤5：记录结果
+    C_comm(:, t) = double(node_comm_status);
+    Raw_cov(:, t) = double(node_comm_status);
+end
+
+%% 输出
+x_comm.C_comm = C_comm;
+x_comm.Raw_cov = Raw_cov;
+x_comm.Xenerg_expected = Xenerg_input;
+x_comm.uav_positions = uav_positions;
+x_comm.mcv_positions = mcv_positions;
+
+%% 目标函数
+%% ========== 通信子问题目标函数 (公式63) ==========
+%% F^com = -ΣΣ ω_i^comm · C_{i,t}^comm + C^UAV,op + Γ^com
+
+%% 1. 通信覆盖质量（最大化，故取负号）
+% -ΣΣ ω_i^comm · C_{i,t}^comm
+comm_quality = 0;
+comm_weight = resources.comm_weight;  % ω_i^comm
+for t = 1:T
+    for i = 1:N
+        comm_quality = comm_quality - comm_weight(i) * C_comm(i, t);
+    end
+end
+
+%% 2. UAV运行成本 C^UAV,op = Σ c_u^UAV · T_u^fly
+C_UAV_op = 0;
+if config.use_uav && n_uav > 0
+    for u_idx = 1:n_uav
+        if u_idx <= length(traffic_solution.uav_task_sequence) && ...
+           ~isempty(traffic_solution.uav_task_sequence{u_idx})
+            
+            % UAV飞行时间 = 到达时间 + 悬停时间
+            arrivals = traffic_solution.uav_task_arrival{u_idx};
+            stays = traffic_solution.uav_task_stays{u_idx};
+            
+            if ~isempty(arrivals) && ~isempty(stays)
+                T_fly = arrivals(end) + stays(end);  % 最后一个任务完成时间
+                C_UAV_op = C_UAV_op + resources.c_UAV_op * T_fly;
+            end
+        end
+    end
+end
+
+%% 3. 通信子问题原始目标
+obj_original = comm_quality + C_UAV_op;
+
+%% 4. ADMM增广拉格朗日惩罚项 Γ^com
+% 共识变量: Y^comm, X^energ, t^UAV
+penalty_Gamma_com = (rho/2) * norm(x_comm.C_comm - z.C_comm + u.comm_Ccomm, 'fro')^2 + ...
+                    (rho/2) * norm(x_comm.Xenerg_expected - z.Xenerg + u.comm_Xenerg, 'fro')^2;
+
+%% 5. 总目标
+obj = obj_original + penalty_Gamma_com;
+
+%% 保存成本分解
+x_comm.cost_breakdown.comm_quality = -comm_quality;  % 转为正数表示覆盖质量
+x_comm.cost_breakdown.C_UAV_op = C_UAV_op;
+x_comm.cost_breakdown.obj_original = obj_original;
+end
+
+function [x_power, obj] = solve_power_subproblem(x_power, z, u, power_net, resources, params, config, deployment, traffic_solution, rho, slack_penalty)
+%% 电力子问题求解 - 与V2相同
+N = params.N; T = params.T; F = params.F; Fset = params.Fset; Dt = params.Dt;
+C_comm_input = z.C_comm;
+drain_complete_time = traffic_solution.drain_complete_time;
+repair_complete_time = traffic_solution.repair_complete_time;
+adj = power_net.adj;
+root = 1;
+
+n_mes = length(deployment.mes_target);
+if config.use_mes && n_mes > 0
+    mes_soc = resources.SOC_init * ones(n_mes, 1);
+    mes_working = zeros(n_mes, T);
+    mes_power_out = zeros(n_mes, T);
+else
+    mes_soc = [];
+    mes_working = [];
+    mes_power_out = [];
+end
+
+n_dg = length(deployment.dg_nodes);
+if config.use_dg && n_dg > 0
+    dg_working = zeros(n_dg, T);
+    dg_power_out = zeros(n_dg, T);
+else
+    dg_working = [];
+    dg_power_out = [];
+end
+
+Xdrain = zeros(F, T);
+Xrepair = zeros(F, T);
+Xgrid = zeros(N, T);
+Xmesenerg = zeros(N, T);
+Xdgenerg = zeros(N, T);
+Xenerg = zeros(N, T);
+Xload = zeros(N, T);
+flow = zeros(N, N, T);
+line_active = zeros(N, N, T);
+slack_power = zeros(N, T);
+slack_comm = zeros(N, T);
+
+for t = 1:T
+    current_time = t * Dt;
+    
+    % 排水/维修状态
+    for k = 1:F
+        if drain_complete_time(k) <= current_time && drain_complete_time(k) < inf
+            Xdrain(k, t) = 1;
+        end
+        if repair_complete_time(k) <= current_time && repair_complete_time(k) < inf
+            Xrepair(k, t) = 1;
+        end
+    end
+    
+    % 电网拓扑
+    current_blocked = false(N, 1);
+    for k = 1:F
+        node = Fset(k);
+        if Xrepair(k, t) == 0
+            current_blocked(node) = true;
+        end
+    end
+    
+    [powered_nodes, flow_t, line_active_t] = single_commodity_flow_power(adj, root, current_blocked, N);
+    flow(:,:,t) = flow_t;
+    line_active(:,:,t) = line_active_t;
+    
+    Xgrid(:, t) = 0;
+    Xgrid(powered_nodes, t) = 1;
+    
+    % DG出力
+    if config.use_dg && ~isempty(deployment.dg_nodes)
+        for d = 1:n_dg
+            dg_node = deployment.dg_nodes(d);
+            f_idx = find(Fset == dg_node);
+            load_demand_kW = power_net.PL_kW(dg_node);
+            dg_rated_kW = resources.dg_max_MW * 1000;
+            
+            if ~isempty(f_idx)
+                if Xdrain(f_idx, t) == 1
+                    dg_working(d, t) = 1;
+                    dg_power_out(d, t) = min(load_demand_kW, dg_rated_kW);
+                    Xdgenerg(dg_node, t) = 1;
+                end
+            else
+                dg_working(d, t) = 1;
+                dg_power_out(d, t) = min(load_demand_kW, dg_rated_kW);
+                Xdgenerg(dg_node, t) = 1;
+            end
+        end
+    end
+    
+    % MES出力
+    if config.use_mes && ~isempty(deployment.mes_target)
+        for m = 1:n_mes
+            if isfield(traffic_solution, 'MES_sequence') && m <= length(traffic_solution.MES_sequence)
+                sequence = traffic_solution.MES_sequence{m};
+                arrivals = traffic_solution.MES_arrival_times{m};
+                durations = traffic_solution.MES_service_durations{m};
+            else
+                if m <= length(deployment.mes_target)
+                    sequence = deployment.mes_target(m);
+                    arrivals = traffic_solution.mes_arrival_time(m);
+                    durations = T * Dt;
+                else
+                    continue;
+                end
+            end
+            
+            if isempty(sequence), continue; end
+            
+            current_target = 0;
+            for kk = 1:length(sequence)
+                if kk <= length(arrivals)
+                    task_start = arrivals(kk);
+                    if kk <= length(durations)
+                        task_end = task_start + durations(kk);
+                    else
+                        task_end = task_start + 4;
+                    end
+                    if current_time >= task_start && current_time < task_end
+                        current_target = sequence(kk);
+                        break;
+                    end
+                end
+            end
+            
+            if current_target > 0
+                f_idx = find(Fset == current_target);
+                if ~isempty(f_idx)
+                    drain_done = Xdrain(f_idx, t) == 1;
+                    available_soc = mes_soc(m) - resources.SOC_min;
+                    
+                    if drain_done && available_soc > 0.01
+                        mes_working(m, t) = 1;
+                        load_demand_kW = power_net.PL_kW(current_target);
+                        power_kW = min(load_demand_kW, resources.mes_max_kW);
+                        
+                        max_energy_MWh = available_soc * resources.mes_capacity_MWh * resources.eta_mes;
+                        max_power_by_soc = max_energy_MWh * 1000 / Dt;
+                        power_kW = min(power_kW, max_power_by_soc);
+                        
+                        mes_power_out(m, t) = power_kW;
+                        energy_out_MWh = power_kW / 1000 * Dt;
+                        mes_soc(m) = mes_soc(m) * (1 - resources.sigma_mes * Dt) - ...
+                            energy_out_MWh / (resources.mes_capacity_MWh * resources.eta_mes);
+                        mes_soc(m) = max(resources.SOC_min, mes_soc(m));
+                        Xmesenerg(current_target, t) = 1;
+                    end
+                end
+            end
+        end
+    end
+    
+    Xenerg(:, t) = double(Xgrid(:, t) | Xmesenerg(:, t) | Xdgenerg(:, t));
+    
+% 新代码：在时间循环外部添加永久恢复标记
+% 在 for t = 1:T 之前添加：
+node_permanently_restored = false(N, 1);  % 记录节点是否已永久恢复
+
+% 然后在循环内修改为：
+for i = 1:N
+    has_power = Xenerg(i, t) >= 0.5;
+    is_fault = ismember(i, Fset);
+    
+    if is_fault
+        if node_permanently_restored(i)
+            % 已经恢复过，保持供电状态
+            Xload(i, t) = 1.0;
+        else
+            % 检查是否满足恢复条件：有电 + 有通信
+            has_comm = C_comm_input(i, t) >= 0.5;
+            if has_power && has_comm
+                node_permanently_restored(i) = true;  % 标记为永久恢复
+                Xload(i, t) = 1.0;
+            else
+                Xload(i, t) = 0.0;
+            end
+        end
+    else
+        Xload(i, t) = double(has_power);
+    end
+end
+end
+
+% 单调性约束
+for t = 2:T
+    for i = 1:N
+        if Xload(i, t-1) >= 0.5 && Xload(i, t) < 0.5
+            Xload(i, t) = 1.0;
+        end
+    end
+end
+
+x_power.T_drain_used = drain_complete_time;
+x_power.T_repair_used = repair_complete_time;
+if ~isempty(traffic_solution.mes_arrival_time)
+    x_power.T_mes_used = traffic_solution.mes_arrival_time;
+else
+    x_power.T_mes_used = zeros(resources.n_mes, 1);
+end
+
+x_power.Xdrain = Xdrain;
+x_power.Xrepair = Xrepair;
+x_power.Xgrid = Xgrid;
+x_power.Xmesenerg = Xmesenerg;
+x_power.Xdgenerg = Xdgenerg;
+x_power.Xenerg = Xenerg;
+x_power.Xload = Xload;
+x_power.C_comm_used = C_comm_input;
+x_power.flow = flow;
+x_power.line_active = line_active;
+x_power.slack_power = slack_power;
+x_power.slack_comm = slack_comm;
+
+if config.use_mes && ~isempty(mes_working)
+    x_power.mes_working = mes_working;
+    x_power.mes_power_out = mes_power_out;
+    x_power.mes_final_soc = mes_soc;
+end
+
+if config.use_dg && ~isempty(dg_working)
+    x_power.dg_working = dg_working;
+    x_power.dg_power_out = dg_power_out;
+end
+
+%% ========== 电力子问题目标函数 (公式61) ==========
+% F^pow = α · C^shed + C^MES,op + Γ^pow
+
+PL_MW = power_net.PL_kW / 1000;
+bus_weight = power_net.bus_weight;
+
+%% 1. 负荷削减成本 C^shed (公式58)
+% C^shed = c^shed · ΣΣ (1 - X^load_{i,t}) · ω_i · P^L_i · Δt
+C_shed = 0;
+for t = 1:T
+    for i = 1:N
+        C_shed = C_shed + resources.c_shed * (1 - Xload(i,t)) * ...
+                 bus_weight(i) * PL_MW(i) * Dt;
+    end
+end
+
+%% 2. MES运行成本 C^MES,op
+% C^MES,op = Σ c_m^MES · T_m^supply
+C_MES_op = 0;
+if config.use_mes && ~isempty(mes_working)
+    for m = 1:size(mes_working, 1)
+        T_supply = sum(mes_working(m, :)) * Dt;  % MES供电时长
+        C_MES_op = C_MES_op + resources.c_MES_op * T_supply;
+    end
+end
+
+%% 3. 电力子问题原始目标（不含ADMM惩罚项）
+obj_original = resources.alpha * C_shed + C_MES_op;
+
+%% 4. 松弛变量惩罚
+slack_cost = slack_penalty * (sum(slack_power(:)) + sum(slack_comm(:)));
+
+%% 5. ADMM增广拉格朗日惩罚项 Γ^pow
+% 共识变量: X^energ, Y^comm, t^drain, t^repair, t^MES
+penalty_Gamma_pow = (rho/2) * norm(x_power.Xenerg - z.Xenerg + u.power_Xenerg, 'fro')^2 + ...
+                    (rho/2) * norm(x_power.C_comm_used - z.C_comm + u.power_Ccomm, 'fro')^2 + ...
+                    (rho/2) * norm(x_power.T_drain_used - z.T_drain + u.power_Tdrain)^2 + ...
+                    (rho/2) * norm(x_power.T_repair_used - z.T_repair + u.power_Trepair)^2;
+
+%% 6. 总目标
+obj = obj_original + slack_cost + penalty_Gamma_pow;
+
+%% 保存成本分解供后续分析
+x_power.cost_breakdown.C_shed = C_shed;
+x_power.cost_breakdown.C_MES_op = C_MES_op;
+x_power.cost_breakdown.obj_original = obj_original;
+end
+
+function [powered_nodes, flow, line_active] = single_commodity_flow_power(adj, root, blocked, N)
+flow = zeros(N, N);
+line_active = zeros(N, N);
+
+visited = false(N, 1);
+parent = zeros(N, 1);
+queue = [root];
+visited(root) = true;
+
+while ~isempty(queue)
+    current = queue(1);
+    queue(1) = [];
+    neighbors = find(adj(current, :));
+    for nb = neighbors
+        if ~visited(nb) && ~blocked(nb)
+            visited(nb) = true;
+            parent(nb) = current;
+            queue = [queue, nb];
+        end
+    end
+end
+
+powered_nodes = find(visited);
+N_reach = length(powered_nodes);
+if N_reach <= 1
+    return;
+end
+
+subtree_size = ones(N, 1);
+subtree_size(~visited) = 0;
+
+node_order = find(visited);
+for idx = length(node_order):-1:1
+    node = node_order(idx);
+    if parent(node) > 0
+        subtree_size(parent(node)) = subtree_size(parent(node)) + subtree_size(node);
+    end
+end
+
+for node = 1:N
+    if visited(node) && parent(node) > 0
+        p = parent(node);
+        flow(p, node) = subtree_size(node);
+        line_active(p, node) = 1;
+        line_active(node, p) = 1;
+    end
+end
+end
+
+function result = assemble_result(x_power, x_comm, x_traffic, z, power_net, params)
+result = struct();
+
+result.Xdrain = x_power.Xdrain;
+result.Xrepair = x_power.Xrepair;
+result.Xgrid = x_power.Xgrid;
+result.Xmesenerg = x_power.Xmesenerg;
+result.Xdgenerg = x_power.Xdgenerg;
+result.Xenerg = x_power.Xenerg;
+result.Xload = x_power.Xload;
+result.C_comm = x_comm.C_comm;
+result.Raw_cov = x_comm.Raw_cov;
+
+if isfield(x_power, 'flow')
+    result.flow = x_power.flow;
+    result.line_active = x_power.line_active;
+end
+
+if isfield(x_power, 'mes_working')
+    result.mes_working = x_power.mes_working;
+    result.mes_power_out = x_power.mes_power_out;
+    result.mes_final_soc = x_power.mes_final_soc;
+end
+
+if isfield(x_power, 'dg_working')
+    result.dg_working = x_power.dg_working;
+    result.dg_power_out = x_power.dg_power_out;
+end
+
+result.drain_complete_time = x_traffic.drain_complete;
+result.repair_complete_time = x_traffic.repair_complete;
+
+N = params.N;
+T = params.T;
+PL_MW = power_net.PL_kW / 1000;
+
+result.load_served_MW = (PL_MW' * result.Xload)';
+result.total_load_MW = sum(PL_MW);
+result.total_load_served = result.load_served_MW';
+result.recovery_ratio = result.load_served_MW / result.total_load_MW;
+result.final_recovery = result.recovery_ratio(end);
+result.resilience_index = sum(result.recovery_ratio) * params.Dt / params.T;
+result.avg_coverage = mean(mean(result.Raw_cov));
+result.avg_connectivity = mean(mean(result.C_comm));
+result.connectivity_ratio = mean(result.C_comm, 1)';
+
+% 诊断信息
+initial_recovery = result.recovery_ratio(1);
+fprintf('    初始恢复率: %.2f%%, 最终恢复率: %.2f%%\n', initial_recovery * 100, result.final_recovery * 100);
+
+result.diagnostics.initial_recovery = initial_recovery;
+result.diagnostics.first_recovery_t = find(result.recovery_ratio > initial_recovery + 0.01, 1);
+%% ========== 新增：全局目标函数成本汇总 ==========
+% 从各子问题提取成本分解
+result.cost = struct();
+
+% 负荷削减成本
+if isfield(x_power, 'cost_breakdown')
+    result.cost.C_shed = x_power.cost_breakdown.C_shed;
+    result.cost.C_MES_op = x_power.cost_breakdown.C_MES_op;
+else
+    result.cost.C_shed = 0;
+    result.cost.C_MES_op = 0;
+end
+
+% 交通调度成本
+if isfield(x_traffic, 'cost_breakdown')
+    result.cost.C_drain = x_traffic.cost_breakdown.C_drain;
+    result.cost.C_repair = x_traffic.cost_breakdown.C_repair;
+else
+    result.cost.C_drain = 0;
+    result.cost.C_repair = 0;
+end
+
+% 通信覆盖与UAV成本
+if isfield(x_comm, 'cost_breakdown')
+    result.cost.comm_quality = x_comm.cost_breakdown.comm_quality;
+    result.cost.C_UAV_op = x_comm.cost_breakdown.C_UAV_op;
+else
+    result.cost.comm_quality = 0;
+    result.cost.C_UAV_op = 0;
+end
+
+% 运行成本汇总 (公式60)
+result.cost.C_operate = result.cost.C_drain + result.cost.C_repair + ...
+                        result.cost.C_MES_op + result.cost.C_UAV_op;
+end
+%% ========================================================================
+%% 修复后的运行优化函数 - 确保四种方案产生不同调度
+%% ========================================================================
+%% 修复内容:
+%%   1. 扩展仓库候选列表（包含相邻节点）
+%%   2. 每个方案使用不同随机种子
+%%   3. 根据方案配置调整调度策略
+%% ========================================================================
+
+function [result, deployment, schedule] = run_optimization_ADMM_v3(power_net, traffic_net, comm_net, flood_scenario, damaged_status, resources, params, config, scheme_id)
+%% ADMM分布式优化 - V3版本 (差异化调度)
+
+fprintf('\n========================================\n');
+fprintf('  ADMM分布式优化 - V3版本 (方案%d)\n', scheme_id);
+fprintf('========================================\n');
+fprintf('  配置: UAV=%d, MCV=%d, MES=%d, DG=%d, Random=%d\n', ...
+    config.use_uav, config.use_mcv, config.use_mes, config.use_dg, config.random_deploy);
+
+if ~isfield(params, 'coords'), params.coords = power_net.coords; end
+if ~isfield(params, 'adj'), params.adj = power_net.adj; end
+
+%% ========================================================================
+%% 关键修复1: 每个方案使用不同的随机种子
+%% ========================================================================
+rng(42 + scheme_id * 1000);  % 方案1: 1042, 方案2: 2042, ...
+fprintf('  随机种子: %d\n', 42 + scheme_id * 1000);
+
+%% ========================================================================
+%% 关键修复2: 扩展仓库候选列表
+%% ========================================================================
+params = expand_warehouse_candidates(params, power_net);
+fprintf('  扩展后仓库候选: %s\n', mat2str(params.Wstart));
+
+%% ========================================================================
+%% 关键修复3: 根据方案配置调整优化策略
+%% ========================================================================
+if config.random_deploy
+    fprintf('  使用随机部署...\n');
+    deployment = generate_random_deployment_v3(params, resources, config, scheme_id);
+    schedule = generate_schedule_v3(deployment, damaged_status, resources, params, config, scheme_id);
+    [result, admm_info] = ADMM_solve_v3(power_net, traffic_net, comm_net, ...
+        damaged_status, resources, deployment, schedule, params, config);
+    result.admm_info = admm_info;
+else
+    fprintf('  启动 IBES + ADMM 优化...\n');
+    [dim, lb, ub, var_info] = setup_decision_variables_v3(resources, params, config);
+    
+    % 传入scheme_id以便差异化评估
+    obj_func = @(x) evaluate_deployment_v3(x, var_info, power_net, traffic_net, comm_net, ...
+        damaged_status, resources, params, config, scheme_id);
+    
+    ibes_params.max_iter = 30;
+    ibes_params.pop_size = 20;
+    
+    [best_x, best_fitness, convergence] = IBES_optimizer_v3(obj_func, dim, lb, ub, ibes_params, scheme_id);
+    
+    deployment = decode_deployment_v3(best_x, var_info, resources, params, config, scheme_id);
+    schedule = generate_schedule_v3(deployment, damaged_status, resources, params, config, scheme_id);
+    [result, admm_info] = ADMM_solve_v3(power_net, traffic_net, comm_net, ...
+        damaged_status, resources, deployment, schedule, params, config);
+    
+    result.ibes_convergence = convergence;
+    result.best_fitness = best_fitness;
+    result.admm_info = admm_info;
+end
+
+fprintf('  优化完成。最终恢复率: %.2f%%\n', result.final_recovery * 100);
+end
+
+%% ========================================================================
+%% 扩展仓库候选列表
+%% ========================================================================
+function params = expand_warehouse_candidates(params, power_net)
+%% 扩展仓库候选：原始候选 + 故障节点的相邻节点
+
+Fset = params.Fset;
+adj = power_net.adj;
+N = params.N;
+
+% 原始候选
+if isfield(params, 'Wstart') && ~isempty(params.Wstart)
+    original_candidates = params.Wstart(:)';
+else
+    original_candidates = [1];
+end
+
+% 添加故障节点
+candidates = unique([original_candidates, Fset(:)']);
+
+% 添加故障节点的相邻节点
+neighbor_nodes = [];
+for f = Fset(:)'
+    neighbors = find(adj(f, :));
+    neighbor_nodes = [neighbor_nodes, neighbors];
+end
+
+% 添加根节点附近的节点（便于资源出发）
+root_neighbors = find(adj(1, :));
+
+% 合并所有候选
+candidates = unique([candidates, neighbor_nodes, root_neighbors, 1]);
+
+% 移除无效节点
+candidates = candidates(candidates >= 1 & candidates <= N);
+
+params.Wstart = candidates(:);
+params.n_warehouse_candidates = length(candidates);
+end
+
+%% ========================================================================
+%% 随机部署 V3
+%% ========================================================================
+function deployment = generate_random_deployment_v3(params, resources, config, scheme_id)
+%% 生成随机部署 - 使用方案相关的随机性
+
+Wstart = params.Wstart;
+Fset = params.Fset;
+F = params.F;
+
+if isempty(Wstart)
+    Wstart = [1; Fset(:)];
+end
+n_wh = length(Wstart);
+
+deployment = struct();
+
+% 维修队仓库 - 随机选择
+repair_idx = randi(n_wh, 1, resources.n_repair);
+deployment.repair_warehouse = Wstart(repair_idx);
+
+% 排水队仓库 - 随机选择（与维修队不同的随机序列）
+drainage_idx = randi(n_wh, 1, resources.n_drainage);
+deployment.drainage_warehouse = Wstart(drainage_idx);
+
+% DG部署
+if config.use_dg && F > 0
+    perm = randperm(F);
+    n_deploy = min(resources.n_dg, F);
+    deployment.dg_nodes = Fset(perm(1:n_deploy));
+else
+    deployment.dg_nodes = [];
+end
+
+% MES部署
+if config.use_mes && F > 0
+    deployment.mes_warehouse = Wstart(randi(n_wh, 1, resources.n_mes));
+    perm = randperm(F);
+    n_deploy = min(resources.n_mes, F);
+    deployment.mes_target = Fset(perm(1:n_deploy));
+else
+    deployment.mes_warehouse = [];
+    deployment.mes_target = [];
+end
+
+% UAV部署
+if config.use_uav && F > 0
+    perm = randperm(F);
+    n_deploy = min(resources.n_uav, F);
+    deployment.uav_target = Fset(perm(1:n_deploy));
+    deployment.uav_init = repmat(Wstart(1), 1, resources.n_uav);
+else
+    deployment.uav_target = [];
+    deployment.uav_init = [];
+end
+
+% MCV部署
+if config.use_mcv && F > 0
+    perm = randperm(F);
+    n_deploy = min(resources.n_mcv, F);
+    deployment.mcv_target = Fset(perm(1:n_deploy));
+    deployment.mcv_init = repmat(Wstart(1), 1, resources.n_mcv);
+else
+    deployment.mcv_target = [];
+    deployment.mcv_init = [];
+end
+end
+
+%% ========================================================================
+%% 调度生成 V3 - 差异化调度
+%% ========================================================================
+function schedule = generate_schedule_v3(deployment, damaged_status, resources, params, config, scheme_id)
+%% 生成可行调度 - 根据方案配置产生不同调度策略
+
+fprintf('\n--- 生成调度 (方案%d) ---\n', scheme_id);
+
+N = params.N;
+T = params.T;
+Dt = params.Dt;
+F = params.F;
+Fset = params.Fset;
+
+if isfield(damaged_status, 'Ttravel')
+    Ttravel = damaged_status.Ttravel;
+else
+    Ttravel = ones(N, N) * 0.5;
+    for i = 1:N
+        Ttravel(i,i) = 0;
+    end
+end
+
+schedule = struct();
+min_start_time = 1.0;
+
+%% ========================================================================
+%% 关键修复: 根据方案配置使用不同的优先级策略
+%% ========================================================================
+priority_drain = calculate_priority(params, config, scheme_id, 'drain');
+priority_repair = calculate_priority(params, config, scheme_id, 'repair');
+
+%% 排水队调度
+fprintf('  排水队调度:\n');
+
+n_drainage = resources.n_drainage;
+if isfield(damaged_status, 'Wneed')
+    Wneed = damaged_status.Wneed(:);
+else
+    Wneed = 1000 * ones(F, 1);
+end
+
+drainage_complete = inf(F, 1);
+drainage_assignment = cell(n_drainage, 1);
+team_time_drain = min_start_time * ones(n_drainage, 1);
+team_pos_drain = deployment.drainage_warehouse(:);
+
+unassigned_drain = 1:F;
+
+while ~isempty(unassigned_drain)
+    [~, team] = min(team_time_drain);
+    current_pos = team_pos_drain(team);
+    
+    best_f = -1;
+    best_score = -inf;
+    
+    for idx = 1:length(unassigned_drain)
+        f_idx = unassigned_drain(idx);
+        node = Fset(f_idx);
+        
+        travel = Ttravel(current_pos, node);
+        
+        % 使用方案特定的优先级
+        score = priority_drain(f_idx) / (travel + 1);
+        
+        if score > best_score
+            best_score = score;
+            best_f = f_idx;
+        end
+    end
+    
+    if best_f > 0
+        node = Fset(best_f);
+        travel_time = Ttravel(current_pos, node);
+        arrival = team_time_drain(team) + travel_time;
+        work_time = Wneed(best_f) / resources.drainage_rate;
+        
+        drainage_complete(best_f) = arrival + work_time;
+        team_time_drain(team) = drainage_complete(best_f);
+        team_pos_drain(team) = node;
+        drainage_assignment{team} = [drainage_assignment{team}; best_f];
+        unassigned_drain(unassigned_drain == best_f) = [];
+        
+        fprintf('    节点%d: 到达%.1fh, 完成%.1fh\n', node, arrival, drainage_complete(best_f));
+    else
+        break;
+    end
+end
+
+schedule.drain_complete_time = drainage_complete;
+schedule.drainage_assignment = drainage_assignment;
+
+%% 维修队调度
+fprintf('  维修队调度:\n');
+
+n_repair = resources.n_repair;
+repair_complete = inf(F, 1);
+repair_assignment = cell(n_repair, 1);
+team_time_repair = min_start_time * ones(n_repair, 1);
+team_pos_repair = deployment.repair_warehouse(:);
+
+% 按排水完成时间和优先级综合排序
+combined_score = zeros(F, 1);
+for k = 1:F
+    % 排水完成越早、优先级越高的节点越先处理
+    combined_score(k) = priority_repair(k) / (drainage_complete(k) + 1);
+end
+[~, repair_order] = sort(combined_score, 'descend');
+unassigned_repair = repair_order(:)';
+
+while ~isempty(unassigned_repair)
+    [~, team] = min(team_time_repair);
+    current_pos = team_pos_repair(team);
+    
+    best_f = -1;
+    best_start = inf;
+    
+    for idx = 1:length(unassigned_repair)
+        f_idx = unassigned_repair(idx);
+        node = Fset(f_idx);
+        
+        travel = Ttravel(current_pos, node);
+        arrival = team_time_repair(team) + travel;
+        start_time = max(arrival, drainage_complete(f_idx));
+        
+        % 加入优先级因素
+        effective_start = start_time - 0.1 * priority_repair(f_idx) / max(priority_repair);
+        
+        if effective_start < best_start
+            best_start = start_time;  % 实际开始时间
+            best_f = f_idx;
+        end
+    end
+    
+    if best_f > 0
+        node = Fset(best_f);
+        work_time = resources.Tsingle(best_f);
+        
+        repair_complete(best_f) = best_start + work_time;
+        team_time_repair(team) = repair_complete(best_f);
+        team_pos_repair(team) = node;
+        repair_assignment{team} = [repair_assignment{team}; best_f];
+        unassigned_repair(unassigned_repair == best_f) = [];
+        
+        fprintf('    节点%d: 开始%.1fh, 完成%.1fh\n', node, best_start, repair_complete(best_f));
+    else
+        break;
+    end
+end
+
+schedule.repair_complete_time = repair_complete;
+schedule.repair_assignment = repair_assignment;
+
+%% MES调度
+schedule = generate_mes_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel, drainage_complete);
+
+%% DG调度
+schedule = generate_dg_schedule(schedule, deployment, params, drainage_complete);
+
+%% UAV调度
+schedule = generate_uav_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel);
+
+%% MCV调度
+schedule = generate_mcv_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel, drainage_complete);
+
+fprintf('  调度生成完成\n');
+end
+
+%% ========================================================================
+%% 计算方案特定的优先级
+%% ========================================================================
+function priority = calculate_priority(params, config, scheme_id, task_type)
+%% 根据方案配置计算不同的优先级策略
+%% 这是产生不同调度路径的关键
+
+Fset = params.Fset;
+F = params.F;
+PL_kW = params.PL_kW;
+bus_weight = params.bus_weight;
+
+% 基础优先级：负荷 × 权重
+base_priority = PL_kW(Fset) .* bus_weight(Fset);
+
+% 根据方案类型调整优先级
+switch scheme_id
+    case 1  % UAV+MES+DG
+        % UAV覆盖范围有限，优先处理高负荷节点
+        priority = base_priority .* 1.2;
+        % 对UAV目标节点给予额外优先级
+        
+    case 2  % MCV+MES+DG
+        % MCV移动较慢但覆盖范围大，可以按地理位置优化
+        % 给予中心区域节点更高优先级
+        coords = params.coords;
+        center = mean(coords, 1);
+        dist_to_center = vecnorm(coords(Fset, :) - center, 2, 2);
+        dist_factor = 1 ./ (dist_to_center + 1);
+        priority = base_priority .* (1 + 0.3 * dist_factor / max(dist_factor));
+        
+    case 3  % UAV+DG (无MES)
+        % 没有MES，需要依赖电网恢复，优先处理上游节点
+        % 节点编号越小通常越靠近电源
+        upstream_factor = 1 ./ (Fset(:) / max(Fset) + 0.5);
+        priority = base_priority .* (1 + 0.4 * upstream_factor);
+        
+    case 4  % Random Deploy
+        % 随机扰动优先级
+        rng(scheme_id * 100 + 7);  % 确保可重复
+        random_factor = 0.5 + rand(F, 1);
+        priority = base_priority .* random_factor;
+        
+    otherwise
+        priority = base_priority;
+end
+
+priority = priority(:);
+end
+
+%% ========================================================================
+%% MES调度子函数
+%% ========================================================================
+function schedule = generate_mes_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel, drainage_complete)
+
+F = params.F;
+Fset = params.Fset;
+T = params.T;
+Dt = params.Dt;
+min_start_time = 1.0;
+
+n_mes = length(deployment.mes_target);
+schedule.MES_sequence = cell(n_mes, 1);
+schedule.MES_arrival_times = cell(n_mes, 1);
+schedule.MES_service_durations = cell(n_mes, 1);
+schedule.MES_nodes = deployment.mes_target;
+
+if config.use_mes && n_mes > 0 && F > 0
+    fault_priority = params.PL_kW(Fset) .* params.bus_weight(Fset);
+    [~, priority_order] = sort(fault_priority, 'descend');
+    nodes_per_mes = ceil(F / max(n_mes, 1));
+    
+    for m = 1:n_mes
+        if m > length(deployment.mes_warehouse)
+            start_pos = deployment.mes_warehouse(1);
+        else
+            start_pos = deployment.mes_warehouse(m);
+        end
+        
+        start_idx = (m-1) * nodes_per_mes + 1;
+        end_idx = min(m * nodes_per_mes, F);
+        if start_idx <= F
+            assigned_faults = priority_order(start_idx:end_idx);
+        else
+            assigned_faults = [];
+        end
+        
+        sequence = [];
+        arrivals = [];
+        durations = [];
+        current_pos = start_pos;
+        current_time = min_start_time;
+        current_soc = resources.SOC_init;
+        
+        for f_idx = assigned_faults'
+            target_node = Fset(f_idx);
+            travel_time = Ttravel(current_pos, target_node);
+            arrival_time = current_time + travel_time;
+            actual_arrival = max(arrival_time, drainage_complete(f_idx));
+            
+            load_kW = params.PL_kW(target_node);
+            service_duration = min(load_kW / resources.mes_max_kW * 2, 4);
+            energy_needed = load_kW * service_duration / 1000;
+            soc_needed = energy_needed / (resources.mes_capacity_MWh * resources.eta_mes);
+            
+            if current_soc - soc_needed > resources.SOC_min
+                sequence = [sequence; target_node];
+                arrivals = [arrivals; actual_arrival];
+                durations = [durations; service_duration];
+                current_pos = target_node;
+                current_time = actual_arrival + service_duration;
+                current_soc = current_soc - soc_needed;
+            end
+        end
+        
+        schedule.MES_sequence{m} = sequence;
+        schedule.MES_arrival_times{m} = arrivals;
+        schedule.MES_service_durations{m} = durations;
+    end
+    
+    schedule.mes_arrival_time = zeros(n_mes, 1);
+    for m = 1:n_mes
+        if ~isempty(schedule.MES_arrival_times{m})
+            schedule.mes_arrival_time(m) = schedule.MES_arrival_times{m}(1);
+        end
+    end
+else
+    schedule.mes_arrival_time = zeros(max(n_mes, 1), 1);
+end
+end
+
+%% ========================================================================
+%% DG调度子函数
+%% ========================================================================
+function schedule = generate_dg_schedule(schedule, deployment, params, drainage_complete)
+
+Fset = params.Fset;
+min_start_time = 1.0;
+
+n_dg = length(deployment.dg_nodes);
+schedule.DG_nodes = deployment.dg_nodes;
+schedule.DG_activation = zeros(n_dg, 1);
+
+for d = 1:n_dg
+    node = deployment.dg_nodes(d);
+    f_idx = find(Fset == node);
+    if ~isempty(f_idx)
+        schedule.DG_activation(d) = drainage_complete(f_idx);
+    else
+        schedule.DG_activation(d) = min_start_time;
+    end
+end
+end
+
+function schedule = generate_uav_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel)
+%% UAV调度生成 - 基于维修完成时间的路径规划
+%% 目标：在维修完成时刻到达故障节点，提供通信覆盖
+
+F = params.F;
+Fset = params.Fset;
+T = params.T;
+Dt = params.Dt;
+N = params.N;
+coords = params.coords;
+
+n_uav = length(deployment.uav_target);
+
+% 初始化输出
+schedule.UAV_sequence = cell(max(n_uav, 1), 1);
+schedule.UAV_arrival_times = cell(max(n_uav, 1), 1);
+schedule.UAV_stay_times = cell(max(n_uav, 1), 1);
+
+if ~config.use_uav || n_uav == 0 || F == 0
+    schedule.uav_task_sequence = schedule.UAV_sequence;
+    schedule.uav_task_arrival = schedule.UAV_arrival_times;
+    schedule.uav_task_stays = schedule.UAV_stay_times;
+    return;
+end
+
+% UAV参数
+uav_speed_kmh = resources.uav_speed_kmh;
+uav_battery_h = resources.uav_battery_h;
+uav_charge_time_h = resources.uav_charge_time;
+uav_range_km = resources.uav_transmission_range_km;
+
+% 计算节点间距离
+if isfield(params, 'node_distance_km')
+    dist_matrix = params.node_distance_km;
+else
+    dist_matrix = zeros(N, N);
+    for i = 1:N
+        for j = 1:N
+            dist_matrix(i,j) = norm(coords(i,:) - coords(j,:));
+        end
+    end
+end
+
+% 获取维修完成时间
+repair_times = schedule.repair_complete_time;  % [F x 1]
+
+% 筛选需要UAV覆盖的节点（维修时间有限的节点）
+valid_faults = find(repair_times < inf);
+if isempty(valid_faults)
+    schedule.uav_task_sequence = schedule.UAV_sequence;
+    schedule.uav_task_arrival = schedule.UAV_arrival_times;
+    schedule.uav_task_stays = schedule.UAV_stay_times;
+    return;
+end
+
+% 按维修完成时间排序
+[sorted_times, sort_idx] = sort(repair_times(valid_faults));
+sorted_faults = valid_faults(sort_idx);
+
+%% 贪心算法：为每个UAV分配任务
+% 考虑电池续航和充电时间
+
+uav_available_time = zeros(n_uav, 1);  % 每个UAV的可用时间
+uav_current_pos = ones(n_uav, 1);      % 每个UAV的当前位置（从控制中心出发）
+uav_battery_remain = uav_battery_h * ones(n_uav, 1);  % 剩余电量（小时）
+
+assigned = false(F, 1);
+
+for u_idx = 1:n_uav
+    sequence = [];
+    arrivals = [];
+    stays = [];
+    
+    current_time = 0;
+    current_pos = 1;  % 从控制中心出发
+    battery_remain = uav_battery_h;
+    
+    % 持续分配任务直到没有可分配的
+    while true
+        best_fault = -1;
+        best_arrival = inf;
+        best_flight_time = inf;
+        
+        % 寻找最佳下一个任务
+        for k = 1:length(sorted_faults)
+            f_idx = sorted_faults(k);
+            if assigned(f_idx)
+                continue;
+            end
+            
+            target_node = Fset(f_idx);
+            target_repair_time = repair_times(f_idx);
+            
+            % 计算飞行时间
+            flight_dist = dist_matrix(current_pos, target_node);
+            flight_time = flight_dist / uav_speed_kmh;
+            
+            % 检查电池是否足够
+            % 需要飞行去 + 悬停 + 返回充电（或飞往下一个任务）
+            min_stay_time = 0.5;  % 最少悬停0.5小时
+            if flight_time + min_stay_time > battery_remain
+                % 电量不足，需要先充电
+                continue;
+            end
+            
+            % 计算预期到达时间
+            earliest_arrival = current_time + flight_time;
+            
+            % 优先选择能在维修完成前到达的任务
+            if earliest_arrival <= target_repair_time + 0.1
+                % 可以准时或提前到达
+                planned_arrival = max(earliest_arrival, target_repair_time - 0.2);
+                
+                if planned_arrival < best_arrival
+                    best_arrival = planned_arrival;
+                    best_fault = f_idx;
+                    best_flight_time = flight_time;
+                end
+            elseif best_fault < 0
+                % 如果没有能准时到达的，选择最早能到的
+                if earliest_arrival < best_arrival
+                    best_arrival = earliest_arrival;
+                    best_fault = f_idx;
+                    best_flight_time = flight_time;
+                end
+            end
+        end
+        
+        if best_fault < 0
+            % 没有更多任务可分配
+            break;
+        end
+        
+        % 分配任务
+        assigned(best_fault) = true;
+        target_node = Fset(best_fault);
+        target_repair_time = repair_times(best_fault);
+        
+        % 计算实际到达时间
+        wait_time = max(0, best_arrival - (current_time + best_flight_time));
+        actual_flight_time = best_flight_time;
+        actual_arrival = current_time + actual_flight_time + wait_time;
+        
+        % 计算悬停时间（覆盖维修完成后一段时间）
+        stay_duration = max(0.5, (target_repair_time + 1.0) - actual_arrival);
+        stay_duration = min(stay_duration, battery_remain - actual_flight_time - 0.1);  % 保留返航电量
+        stay_duration = max(0.3, stay_duration);
+        
+        % 更新状态
+        sequence = [sequence; target_node];
+        arrivals = [arrivals; actual_arrival];
+        stays = [stays; stay_duration];
+        
+        current_time = actual_arrival + stay_duration;
+        current_pos = target_node;
+        battery_remain = battery_remain - actual_flight_time - stay_duration;
+        
+        % 检查是否需要充电
+        if battery_remain < 0.3  % 低于0.3小时电量
+            % 返回充电
+            return_dist = dist_matrix(current_pos, 1);
+            return_time = return_dist / uav_speed_kmh;
+            
+            if battery_remain >= return_time
+                current_time = current_time + return_time + uav_charge_time_h;
+                current_pos = 1;
+                battery_remain = uav_battery_h;
+            else
+                % 电量不足返航，结束该UAV任务
+                break;
+            end
+        end
+    end
+    
+    schedule.UAV_sequence{u_idx} = sequence;
+    schedule.UAV_arrival_times{u_idx} = arrivals;
+    schedule.UAV_stay_times{u_idx} = stays;
+end
+
+% 兼容旧字段名
+schedule.uav_task_sequence = schedule.UAV_sequence;
+schedule.uav_task_arrival = schedule.UAV_arrival_times;
+schedule.uav_task_stays = schedule.UAV_stay_times;
+
+% 打印调度信息
+fprintf('  UAV调度生成完成:\n');
+for u_idx = 1:n_uav
+    seq = schedule.UAV_sequence{u_idx};
+    if ~isempty(seq)
+        fprintf('    UAV%d: 服务%d个节点 [', u_idx, length(seq));
+        for k = 1:min(3, length(seq))
+            fprintf('%d', seq(k));
+            if k < min(3, length(seq)), fprintf(','); end
+        end
+        if length(seq) > 3, fprintf('...'); end
+        fprintf(']\n');
+    else
+        fprintf('    UAV%d: 无任务\n', u_idx);
+    end
+end
+end
+
+%% ========================================================================
+%% MCV调度子函数
+%% ========================================================================
+function schedule = generate_mcv_schedule(schedule, deployment, damaged_status, resources, params, config, Ttravel, drainage_complete)
+
+F = params.F;
+Fset = params.Fset;
+T = params.T;
+Dt = params.Dt;
+min_start_time = 1.0;
+
+n_mcv = length(deployment.mcv_target);
+schedule.MCV_sequence = cell(n_mcv, 1);
+schedule.MCV_arrival_times = cell(n_mcv, 1);
+schedule.MCV_stay_times = cell(n_mcv, 1);
+schedule.MCV_nodes = deployment.mcv_target;
+
+if config.use_mcv && n_mcv > 0 && F > 0
+    fault_priority = params.PL_kW(Fset) .* params.bus_weight(Fset);
+    [~, priority_order] = sort(fault_priority, 'descend');
+    nodes_per_mcv = ceil(F / max(n_mcv, 1));
+    
+    for m = 1:n_mcv
+        if m > length(deployment.mcv_init)
+            start_pos = 1;
+        else
+            start_pos = deployment.mcv_init(m);
+        end
+        
+        start_idx = (m-1) * nodes_per_mcv + 1;
+        end_idx = min(m * nodes_per_mcv, F);
+        if start_idx <= F
+            assigned_faults = priority_order(start_idx:end_idx);
+        else
+            assigned_faults = [];
+        end
+        
+        sequence = [];
+        arrivals = [];
+        stays = [];
+        current_pos = start_pos;
+        current_time = min_start_time;
+        
+        for f_idx = assigned_faults'
+            target_node = Fset(f_idx);
+            travel_time = Ttravel(current_pos, target_node);
+            arrival_time = current_time + travel_time;
+            actual_arrival = max(arrival_time, drainage_complete(f_idx));
+            
+            service_duration = 2 + params.PL_kW(target_node) / 500;
+            service_duration = min(service_duration, 6);
+            
+            sequence = [sequence; target_node];
+            arrivals = [arrivals; actual_arrival];
+            stays = [stays; service_duration];
+            
+            current_pos = target_node;
+            current_time = actual_arrival + service_duration;
+        end
+        
+        schedule.MCV_sequence{m} = sequence;
+        schedule.MCV_arrival_times{m} = arrivals;
+        schedule.MCV_stay_times{m} = stays;
+    end
+    
+    schedule.mcv_arrival_time = zeros(n_mcv, 1);
+    for m = 1:n_mcv
+        if ~isempty(schedule.MCV_arrival_times{m})
+            schedule.mcv_arrival_time(m) = schedule.MCV_arrival_times{m}(1);
+        end
+    end
+else
+    schedule.mcv_arrival_time = [];
+end
+
+schedule.mcv_task_sequence = schedule.MCV_sequence;
+schedule.mcv_task_arrival = schedule.MCV_arrival_times;
+end
+%% ========================================================================
+%% 以下是需要添加到 run_optimization_ADMM_v3.m 中的其他辅助函数
+%% ========================================================================
+
+function [dim, lb, ub, var_info] = setup_decision_variables_v3(resources, params, config)
+%% 设置决策变量 - 与v2相同
+var_info = struct();
+dim = 0;
+
+var_info.repair_wh_start = dim + 1;
+dim = dim + resources.n_repair;
+var_info.repair_wh_end = dim;
+
+var_info.drainage_wh_start = dim + 1;
+dim = dim + resources.n_drainage;
+var_info.drainage_wh_end = dim;
+
+if config.use_dg
+    var_info.dg_start = dim + 1;
+    dim = dim + resources.n_dg;
+    var_info.dg_end = dim;
+end
+
+if config.use_mes
+    var_info.mes_wh_start = dim + 1;
+    dim = dim + resources.n_mes;
+    var_info.mes_wh_end = dim;
+    var_info.mes_target_start = dim + 1;
+    dim = dim + resources.n_mes;
+    var_info.mes_target_end = dim;
+end
+
+if config.use_uav
+    var_info.uav_target_start = dim + 1;
+    dim = dim + resources.n_uav;
+    var_info.uav_target_end = dim;
+end
+
+if config.use_mcv
+    var_info.mcv_target_start = dim + 1;
+    dim = dim + resources.n_mcv;
+    var_info.mcv_target_end = dim;
+end
+
+var_info.dim = dim;
+lb = zeros(1, dim);
+ub = ones(1, dim);
+end
+
+function deployment = decode_deployment_v3(x, var_info, resources, params, config, scheme_id)
+%% 解码部署决策 - 加入方案相关随机性
+
+Wstart = params.Wstart;
+Fset = params.Fset;
+F = params.F;
+
+if isempty(Wstart)
+    Wstart = [1; Fset(:)];
+end
+n_wh = length(Wstart);
+
+deployment = struct();
+
+% 维修队仓库
+repair_idx = ceil(x(var_info.repair_wh_start:var_info.repair_wh_end) * n_wh);
+repair_idx = max(1, min(n_wh, repair_idx));
+deployment.repair_warehouse = Wstart(repair_idx);
+
+% 排水队仓库
+drainage_idx = ceil(x(var_info.drainage_wh_start:var_info.drainage_wh_end) * n_wh);
+drainage_idx = max(1, min(n_wh, drainage_idx));
+deployment.drainage_warehouse = Wstart(drainage_idx);
+
+% DG部署
+if config.use_dg && F > 0
+    dg_idx = ceil(x(var_info.dg_start:var_info.dg_end) * F);
+    dg_idx = max(1, min(F, dg_idx));
+    deployment.dg_nodes = Fset(unique(dg_idx));
+    
+    % 确保部署足够数量
+    while length(deployment.dg_nodes) < resources.n_dg && length(deployment.dg_nodes) < F
+        new_idx = randi(F);
+        if ~ismember(Fset(new_idx), deployment.dg_nodes)
+            deployment.dg_nodes = [deployment.dg_nodes, Fset(new_idx)];
+        end
+    end
+else
+    deployment.dg_nodes = [];
+end
+
+% MES部署
+if config.use_mes && F > 0
+    mes_wh_idx = ceil(x(var_info.mes_wh_start:var_info.mes_wh_end) * n_wh);
+    mes_wh_idx = max(1, min(n_wh, mes_wh_idx));
+    deployment.mes_warehouse = Wstart(mes_wh_idx);
+    
+    mes_tgt_idx = ceil(x(var_info.mes_target_start:var_info.mes_target_end) * F);
+    mes_tgt_idx = max(1, min(F, mes_tgt_idx));
+    deployment.mes_target = Fset(mes_tgt_idx);
+else
+    deployment.mes_warehouse = [];
+    deployment.mes_target = [];
+end
+
+% UAV部署
+if config.use_uav && F > 0
+    uav_idx = ceil(x(var_info.uav_target_start:var_info.uav_target_end) * F);
+    uav_idx = max(1, min(F, uav_idx));
+    deployment.uav_target = Fset(uav_idx);
+    deployment.uav_init = repmat(Wstart(1), 1, resources.n_uav);
+else
+    deployment.uav_target = [];
+    deployment.uav_init = [];
+end
+
+% MCV部署
+if config.use_mcv && F > 0
+    mcv_idx = ceil(x(var_info.mcv_target_start:var_info.mcv_target_end) * F);
+    mcv_idx = max(1, min(F, mcv_idx));
+    deployment.mcv_target = Fset(mcv_idx);
+    deployment.mcv_init = repmat(Wstart(1), 1, resources.n_mcv);
+else
+    deployment.mcv_target = [];
+    deployment.mcv_init = [];
+end
+end
+
+function fitness = evaluate_deployment_v3(x, var_info, power_net, traffic_net, comm_net, damaged_status, resources, params, config, scheme_id)
+%% 评估部署方案
+
+try
+    if ~isfield(params, 'coords'), params.coords = power_net.coords; end
+    if ~isfield(params, 'adj'), params.adj = power_net.adj; end
+    
+    deployment = decode_deployment_v3(x, var_info, resources, params, config, scheme_id);
+    schedule = generate_schedule_v3(deployment, damaged_status, resources, params, config, scheme_id);
+    [result, ~] = ADMM_solve_v3(power_net, traffic_net, comm_net, ...
+        damaged_status, resources, deployment, schedule, params, config);
+    
+    T = params.T;
+    recovery_efficiency = 0;
+    for t = 1:T
+        recovery_efficiency = recovery_efficiency + t * result.total_load_served(t);
+    end
+    
+    fitness = -recovery_efficiency;
+catch ME
+    fprintf('    评估错误: %s\n', ME.message);
+    fitness = 1e6;
+end
+end
+
+function [best_x, best_fitness, convergence] = IBES_optimizer_v3(obj_func, dim, lb, ub, ibes_params, scheme_id)
+%% IBES优化器 - 使用方案相关随机种子
+
+% 确保每个方案有不同的搜索轨迹
+rng(42 + scheme_id * 1000 + 100);
+
+max_iter = ibes_params.max_iter;
+pop_size = ibes_params.pop_size;
+a = 10;
+R = 1.5;
+beta_levy = 1.5;
+
+% 初始化种群 - 混沌序列
+X = zeros(pop_size, dim);
+chaos_x = rand();
+for i = 1:pop_size
+    for j = 1:dim
+        chaos_x = 4 * chaos_x * (1 - chaos_x);
+        X(i, j) = lb(j) + chaos_x * (ub(j) - lb(j));
+    end
+end
+
+fitness = zeros(pop_size, 1);
+for i = 1:pop_size
+    fitness(i) = obj_func(X(i, :));
+end
+
+[best_fitness, best_idx] = min(fitness);
+best_x = X(best_idx, :);
+Mean_pos = mean(X, 1);
+
+convergence = zeros(max_iter, 1);
+fprintf('    IBES优化 (方案%d)...\n', scheme_id);
+
+for iter = 1:max_iter
+    a_t = a * (1 - iter / max_iter);
+    R_t = R * (1 + 0.5 * sin(pi * iter / max_iter));
+    
+    % 探索阶段
+    for i = 1:pop_size
+        w = 0.5 + 0.5 * rand() * (1 - iter / max_iter);
+        theta = a_t * pi * rand();
+        r = theta + R_t * rand();
+        x_new = best_x + r * cos(theta) * (Mean_pos - X(i, :)) + r * sin(theta) * (best_x - X(i, :)) * w;
+        x_new = max(lb, min(ub, x_new));
+        f_new = obj_func(x_new);
+        if f_new < fitness(i)
+            X(i, :) = x_new;
+            fitness(i) = f_new;
+        end
+    end
+    
+    % Levy飞行
+    for i = 1:pop_size
+        levy_step = levy_flight_v3(dim, beta_levy);
+        theta = pi * rand();
+        r = theta + R_t * rand();
+        if rand() < 0.5
+            x_new = X(i, :) + r * levy_step .* (best_x - X(i, :));
+        else
+            j = randi(pop_size);
+            x_new = X(i, :) + r * cos(theta) * (Mean_pos - X(i, :)) + r * sin(theta) * (X(j, :) - X(i, :));
+        end
+        x_new = max(lb, min(ub, x_new));
+        f_new = obj_func(x_new);
+        if f_new < fitness(i)
+            X(i, :) = x_new;
+            fitness(i) = f_new;
+        end
+    end
+    
+    % 开发阶段
+    for i = 1:pop_size
+        step = 2 * rand() * (1 - iter / max_iter);
+        j = randi(pop_size);
+        while j == i
+            j = randi(pop_size);
+        end
+        x_new = X(i, :) + step * rand(1, dim) .* (best_x - X(i, :)) + ...
+            (1 - step) * rand(1, dim) .* (X(j, :) - X(i, :)) * (rand() - 0.5);
+        if rand() < 0.1
+            sigma = 0.1 * (1 - iter / max_iter);
+            x_new = x_new + sigma * randn(1, dim) .* (ub - lb);
+        end
+        x_new = max(lb, min(ub, x_new));
+        f_new = obj_func(x_new);
+        if f_new < fitness(i)
+            X(i, :) = x_new;
+            fitness(i) = f_new;
+        end
+    end
+    
+    % 反向学习
+    if rand() < 0.3
+        for i = 1:pop_size
+            x_opp = lb + ub - X(i, :);
+            x_opp = max(lb, min(ub, x_opp));
+            f_opp = obj_func(x_opp);
+            if f_opp < fitness(i)
+                X(i, :) = x_opp;
+                fitness(i) = f_opp;
+            end
+        end
+    end
+    
+    [current_best, best_idx] = min(fitness);
+    if current_best < best_fitness
+        best_fitness = current_best;
+        best_x = X(best_idx, :);
+    end
+    Mean_pos = mean(X, 1);
+    convergence(iter) = best_fitness;
+    
+    if mod(iter, 10) == 0
+        fprintf('      迭代 %d/%d, 最佳适应度: %.4f\n', iter, max_iter, best_fitness);
+    end
+end
+
+fprintf('    IBES完成. 最佳适应度: %.4f\n', best_fitness);
+end
+
+function step = levy_flight_v3(dim, beta)
+sigma_u = (gamma(1 + beta) * sin(pi * beta / 2) / (gamma((1 + beta) / 2) * beta * 2^((beta - 1) / 2)))^(1 / beta);
+u = randn(1, dim) * sigma_u;
+v = randn(1, dim);
+step = u ./ (abs(v).^(1 / beta));
+end
