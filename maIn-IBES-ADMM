@@ -1,0 +1,1429 @@
+%% ========================================================================
+%% 电力-交通-通信耦合网络协同恢复优化 - V2版主程序
+%% ========================================================================
+%% 核心修复内容:
+%%   [Fix 1] 使用单商品流法建模电网和通信网的网络拓扑约束
+%%   [Fix 2] 正确处理上游故障导致的下游失电（级联失电）
+%%   [Fix 3] 严格强制排水/维修前置约束，确保t=0时刻不恢复
+%%   [Fix 4] 使用用户提供的灾害场景生成代码
+%% ========================================================================
+
+clear; clc; close all;
+warning('off', 'all');
+rng(42);
+
+fprintf('========================================================\n');
+fprintf('  电力-交通-通信耦合网络\n');
+fprintf('  洪涝灾害下协同恢复优化 (V2修复版)\n');
+fprintf('  - 单商品流网络拓扑约束\n');
+fprintf('  - 级联失电正确建模\n');
+fprintf('========================================================\n\n');
+
+%% 1. 初始化三网耦合系统
+fprintf('[步骤1] 初始化IEEE 33节点耦合网络系统...\n');
+[power_net, traffic_net, comm_net, params] = init_coupled_networks_v2();
+fprintf('  - 电力网节点: %d, 线路: %d\n', power_net.n_nodes, power_net.n_lines);
+fprintf('  - 交通网节点: %d, 道路: %d\n', traffic_net.n_nodes, traffic_net.n_roads);
+fprintf('  - 通信基站: %d\n', comm_net.n_base_stations);
+
+%% 2. 洪涝灾害场景生成（使用用户提供的代码）
+fprintf('\n[步骤2] 生成洪涝灾害场景...\n');
+[flood_scenario, damaged_status, params] = generate_flood_scenario_v2(power_net, traffic_net, comm_net, params);
+comm_net.damaged_stations = damaged_status.damaged_base_stations;
+
+params.use_stochastic = true;
+params.flood_scenario = flood_scenario;
+fprintf('  - 洪涝区域数: %d\n', flood_scenario.n_flood_zones);
+fprintf('  - 受损电力节点: %s\n', mat2str(params.Fset));
+fprintf('  - 阻断道路数: %d\n', sum(damaged_status.road_blocked));
+
+%% 3. 计算初始失电状态（考虑级联失电）
+fprintf('\n[步骤3] 计算初始失电状态（含级联失电）...\n');
+[initial_outage_nodes, cascade_info] = compute_initial_outage_v2(power_net, params);
+fprintf('  - 故障节点数: %d\n', length(params.Fset));
+fprintf('  - 级联失电节点数: %d\n', length(cascade_info.cascade_only_nodes));
+fprintf('  - 总失电节点数: %d (占%.1f%%)\n', length(initial_outage_nodes), ...
+    100*length(initial_outage_nodes)/params.N);
+fprintf('  - 初始失负荷: %.2f MW (%.1f%%)\n', cascade_info.initial_lost_load_MW, ...
+    cascade_info.initial_loss_percent);
+
+params.initial_outage_nodes = initial_outage_nodes;
+params.cascade_info = cascade_info;
+
+%% 4. 初始化资源参数
+
+resources = init_resources_v2(params);
+
+
+%% 5. 运行四种方案对比 (使用V3版本)
+fprintf('\n[步骤5] 运行四种恢复方案优化 (V3差异化调度)...\n');
+
+results   = cell(4, 1);
+deploys   = cell(4, 1);
+schedules = cell(4, 1);
+configs   = cell(4, 1);
+
+scheme_names = {'UAV+MES+DG', 'MCV+MES+DG', 'UAV+DG', 'Random Deploy'};
+
+for scheme = 1:4
+    fprintf('\n--- 方案 %d: %s ---\n', scheme, scheme_names{scheme});
+    
+    config = get_scheme_config_v2(scheme);
+    configs{scheme} = config;
+    
+    %% 关键修改: 传入scheme_id以实现差异化
+    [results{scheme}, deploys{scheme}, schedules{scheme}] = ...
+        run_optimization_ADMM_v3(power_net, traffic_net, comm_net, ...
+        flood_scenario, damaged_status, resources, params, config, scheme);  % 注意新增scheme参数
+end
+
+%% 6. 结果分析与可视化
+fprintf('\n[步骤6] 结果分析与可视化...\n');
+
+% 打印部署结果
+print_deployment_results_v2(deploys, scheme_names, params);
+
+% 打印调度路径
+print_scheduling_paths_v2(schedules, scheme_names, params);
+
+% 计算并打印指标
+metrics = cell(4, 1);
+for s = 1:4
+    metrics{s} = calculate_metrics_v2(results{s}, resources, params, configs{s});
+end
+all_costs = zeros(4, 1);
+for s = 1:4
+    all_costs(s) = metrics{s}.total_cost;
+end
+max_cost = max(all_costs);
+min_cost = min(all_costs);
+
+for s = 1:4
+    if max_cost > min_cost
+        % 成本越低，经济指数越高
+        metrics{s}.economic_index = (max_cost - metrics{s}.total_cost) / (max_cost - min_cost);
+    else
+        metrics{s}.economic_index = 1;
+    end
+end
+print_metrics_comparison_v2(metrics, scheme_names);
+
+%% 可视化
+plot_load_recovery_curves_v2(results, scheme_names, params);
+plot_admm_convergence_v2(results, scheme_names);
+plot_cascade_analysis_v2(power_net, params, results{1});
+plot_mes_soc_curves(results, scheme_names, params);
+plot_mes_dg_power_output(results, scheme_names, params, resources);  % 新增
+plot_metrics_radar(metrics, scheme_names);
+plot_comm_coverage_curves(results, scheme_names, params);
+plot_load_recovery_gantt(results, schedules, scheme_names, params);
+
+fprintf('\n========================================================\n');
+fprintf('  优化完成!\n');
+fprintf('========================================================\n');
+
+%% 保存结果
+save('optimization_results_v2.mat', 'results', 'deploys', 'schedules', 'metrics', ...
+    'power_net', 'traffic_net', 'comm_net', 'flood_scenario', 'damaged_status', 'params');
+fprintf('结果已保存至 optimization_results_v2.mat\n');
+% 在 main 中添加诊断代码，查看UAV调度详情
+fprintf('\n===== UAV调度诊断 (基于15km回传距离) =====\n');
+sch = schedules{1};  % 方案1的调度
+fprintf('维修完成时间:\n');
+for k = 1:params.F
+    fprintf('  故障节点%d (节点%d): 维修完成 %.1fh\n', k, params.Fset(k), sch.repair_complete_time(k));
+end
+fprintf('\nUAV调度:\n');
+for u = 1:length(sch.UAV_sequence)
+    seq = sch.UAV_sequence{u};
+    arr = sch.UAV_arrival_times{u};
+    stays = sch.UAV_stay_times{u};
+    fprintf('  UAV%d: ', u);
+    if isempty(seq)
+        fprintf('无任务\n');
+    else
+        for k = 1:length(seq)
+            node = seq(k);
+            % 计算该节点到控制中心的距离
+            dist_to_center = params.node_distance_km(node, 1);
+            fprintf('节点%d(到达%.1fh, 停留%.1fh, 距控制中心%.1fkm) ', ...
+                node, arr(k), stays(k), dist_to_center);
+        end
+        fprintf('\n');
+    end
+end
+
+% 显示通信覆盖分析
+fprintf('\n===== 通信覆盖分析 =====\n');
+result = results{1};
+for t = [1, 5, 10, 15, 20, 25, 30]
+    if t <= params.T
+        coverage = mean(result.C_comm(:, t)) * 100;
+        fprintf('  t=%2dh: 通信覆盖率 %.1f%%\n', t, coverage);
+    end
+end
+%% ========================================================================
+%% 辅助函数
+%% ========================================================================
+
+function config = get_scheme_config_v2(scheme)
+config = struct();
+switch scheme
+    case 1
+        config.use_uav = true;
+        config.use_mcv = false;
+        config.use_mes = true;
+        config.use_dg = true;
+        config.random_deploy = false;
+    case 2
+        config.use_uav = false;
+        config.use_mcv = true;
+        config.use_mes = true;
+        config.use_dg = true;
+        config.random_deploy = false;
+    case 3
+        config.use_uav = true;
+        config.use_mcv = false;
+        config.use_mes = false;
+        config.use_dg = true;
+        config.random_deploy = false;
+    case 4
+        config.use_uav = true;
+        config.use_mcv = false;
+        config.use_mes = true;
+        config.use_dg = true;
+        config.random_deploy = true;
+end
+end
+
+function resources = init_resources_v2(params)
+%% 初始化恢复资源参数 (使用用户提供的参数)
+
+%% 维修队
+resources.n_repair = 2;
+resources.repair_speed_kmh = 30;
+resources.Tsingle = 3 * ones(params.F, 1);
+
+%% 排水队
+resources.n_drainage = 2;
+resources.drainage_speed_kmh = 30;
+resources.drainage_rate = 600;
+resources.Qmax_drain = 8000;
+
+%% MES参数
+resources.n_mes = 2;
+resources.mes_capacity_MWh = 5;
+resources.mes_max_kW = 500;
+resources.mes_min_kW = 20;
+resources.mes_max_kVar = 250;
+resources.SOC_init = 0.9;
+resources.SOC_min = 0.15;
+resources.SOC_max = 0.95;
+resources.eta_mes = 0.88;
+resources.sigma_mes = 0.01;
+resources.mes_speed_kmh = 40;
+
+%% DG参数
+resources.n_dg = 2;
+resources.dg_max_MW = 0.5;
+resources.dg_max_MVar = 0.5;
+resources.dg_candidate_nodes = params.Fset;
+
+%% ===== 大疆M4TD无人机参数 (修改) =====
+resources.n_uav = 3;
+
+% 飞行性能
+resources.uav_max_flight_min = 54;           % 最大飞行时间: 54分钟
+resources.uav_max_hover_min = 47;            % 最大悬停时间: 47分钟  
+resources.uav_cruise_speed_ms = 15;          % 巡航速度: 15 m/s
+resources.uav_speed_kmh = 54;                % 巡航速度: 54 km/h
+resources.uav_battery_h = 54/60;             % 电池续航: 0.9小时
+
+% 通信参数 - 关键修改
+resources.uav_transmission_range_km = 15;    % 卫星通信回传距离: 15km
+resources.uav_relay_supported = true;        % 支持无人机自组网中继
+resources.uav_to_uav_range_km = 15;          % 无人机间中继距离: 15km
+
+% 充电参数  
+resources.uav_charge_time_min = 27;          % 快充时间: 27分钟(15%-95%)
+resources.uav_charge_time = 27/60;           % 充电时间: 0.45小时
+resources.uav_low_battery_pct = 0.20;        % 低电量阈值: 20%
+
+% 节点间距离
+resources.node_distance_km = 2;              % 节点间距离: 1km
+
+% 删除跳数相关参数
+% resources.uav_coverage_hop = 15;  % 不再使用
+% resources.N_c = 10;               % 不再使用
+
+%% MCV参数 (修改)
+resources.n_mcv = 2;
+resources.mcv_coverage_range_km = 1.5;         % MCV覆盖半径: 2km
+resources.mcv_speed_kmh = 50;
+% resources.mcv_coverage_hop = 2;  % 不再使用
+
+%% MCV参数
+resources.n_mcv = 2;
+resources.mcv_coverage_hop = 2;
+resources.mcv_speed_kmh = 50;
+
+%% 成本参数
+resources.load_shed_cost = 1000;         % 切负荷成本权重系数（大幅提高）
+resources.mes_deploy_cost = 500000;        % MES部署成本（元）
+resources.mes_operate_cost = 1000;         % MES运行成本（元/小时）
+resources.dg_deploy_cost = 300000;         % DG部署成本（元）
+resources.dg_operate_cost = 1500;          % DG运行成本（元/小时）
+resources.uav_deploy_cost = 51100;        % 大疆MT4D无人机及DRTK3成本：5.1万元
+resources.uav_operate_cost = 500;          % UAV运行成本（元/小时）
+resources.mcv_deploy_cost = 300000;       % 通信车成本：80万元
+resources.mcv_operate_cost = 2000;         % MCV运行成本（元/小时）
+
+%% 时间参数
+resources.T = params.T;
+resources.Dt = params.Dt;
+
+%% 道路排水参数
+resources.n_road_drainage = 1;
+resources.road_drain_time = 2.0;
+resources.road_drain_depth = 0.1;
+
+%% ========== 新增：全局目标函数成本参数 ==========
+% 负荷削减成本权重 (公式57中的α)
+resources.alpha = 100;  % 较大权重确保负荷恢复优先
+
+% 单位负荷削减成本 c^shed (公式58)
+resources.c_shed = 1000;  % 元/MWh
+
+% 单位部署成本 (公式59) - 已有，确认参数名称
+resources.c_DG = resources.dg_deploy_cost;       % c^DG
+resources.c_MES = resources.mes_deploy_cost;     % c^MES  
+resources.c_UAV = resources.uav_deploy_cost;     % c^UAV
+resources.c_MCV = resources.mcv_deploy_cost;     % c^MCV (如果需要)
+
+% 单位运行成本 (公式60)
+resources.c_drain = 500;      % 排水队运行成本 c_p^drain (元/小时)
+resources.c_repair = 800;     % 维修队运行成本 c_g^repair (元/小时)
+resources.c_MES_op = resources.mes_operate_cost;  % MES运行成本 c_m^MES
+resources.c_UAV_op = resources.uav_operate_cost;  % UAV运行成本 c_u^UAV
+
+%% 通信权重 (公式63中的ω_i^comm)
+resources.comm_weight = params.bus_weight;  % 默认使用负荷权重
+
+
+end
+
+function print_deployment_results_v2(deploys, scheme_names, params)
+fprintf('\n========================================\n');
+fprintf('        资源部署结果\n');
+fprintf('========================================\n');
+
+for s = 1:4
+    fprintf('\n[方案 %d: %s]\n', s, scheme_names{s});
+    d = deploys{s};
+    
+    fprintf('  维修队仓库: %s\n', mat2str(d.repair_warehouse));
+    fprintf('  排水队仓库: %s\n', mat2str(d.drainage_warehouse));
+    
+    if ~isempty(d.dg_nodes)
+        fprintf('  DG部署节点: %s\n', mat2str(d.dg_nodes));
+    else
+        fprintf('  DG部署: 无\n');
+    end
+    
+    if ~isempty(d.mes_target)
+        fprintf('  MES仓库: %s\n', mat2str(d.mes_warehouse));
+        fprintf('  MES目标节点: %s\n', mat2str(d.mes_target));
+    else
+        fprintf('  MES: 无\n');
+    end
+    
+    if ~isempty(d.uav_target)
+        fprintf('  UAV目标节点: %s\n', mat2str(d.uav_target));
+    else
+        fprintf('  UAV: 无\n');
+    end
+    
+    if ~isempty(d.mcv_target)
+        fprintf('  MCV目标节点: %s\n', mat2str(d.mcv_target));
+    else
+        fprintf('  MCV: 无\n');
+    end
+end
+end
+
+function print_scheduling_paths_v2(schedules, scheme_names, params)
+fprintf('\n========================================\n');
+fprintf('        资源调度路径详情\n');
+fprintf('========================================\n');
+
+Fset = params.Fset;
+F = length(Fset);
+
+for s = 1:4
+    fprintf('\n[方案 %d: %s]\n', s, scheme_names{s});
+    sch = schedules{s};
+    
+    if isempty(sch)
+        fprintf('  调度信息为空\n');
+        continue;
+    end
+    
+    %% 排水队调度路径
+    fprintf('\n  --- 排水队调度 ---\n');
+    if isfield(sch, 'drainage_assignment') && ~isempty(sch.drainage_assignment)
+        for team = 1:length(sch.drainage_assignment)
+            assignment = sch.drainage_assignment{team};
+            if isempty(assignment)
+                fprintf('    排水队%d: 无任务\n', team);
+                continue;
+            end
+            fprintf('    排水队%d:\n', team);
+            fprintf('      任务序列: ');
+            route_str = '';
+            for k = 1:length(assignment)
+                f_idx = assignment(k);
+                node = Fset(f_idx);
+                if k == 1
+                    route_str = sprintf('节点%d', node);
+                else
+                    route_str = sprintf('%s -> 节点%d', route_str, node);
+                end
+            end
+            fprintf('%s\n', route_str);
+            fprintf('      完成时间: ');
+            for k = 1:length(assignment)
+                f_idx = assignment(k);
+                fprintf('节点%d(%.1fh) ', Fset(f_idx), sch.drain_complete_time(f_idx));
+            end
+            fprintf('\n');
+        end
+    else
+        fprintf('    排水队调度信息不可用\n');
+    end
+    
+    %% 维修队调度路径
+    fprintf('\n  --- 维修队调度 ---\n');
+    if isfield(sch, 'repair_assignment') && ~isempty(sch.repair_assignment)
+        for team = 1:length(sch.repair_assignment)
+            assignment = sch.repair_assignment{team};
+            if isempty(assignment)
+                fprintf('    维修队%d: 无任务\n', team);
+                continue;
+            end
+            fprintf('    维修队%d:\n', team);
+            fprintf('      任务序列: ');
+            route_str = '';
+            for k = 1:length(assignment)
+                f_idx = assignment(k);
+                node = Fset(f_idx);
+                if k == 1
+                    route_str = sprintf('节点%d', node);
+                else
+                    route_str = sprintf('%s -> 节点%d', route_str, node);
+                end
+            end
+            fprintf('%s\n', route_str);
+            fprintf('      完成时间: ');
+            for k = 1:length(assignment)
+                f_idx = assignment(k);
+                fprintf('节点%d(%.1fh) ', Fset(f_idx), sch.repair_complete_time(f_idx));
+            end
+            fprintf('\n');
+        end
+    else
+        fprintf('    维修队调度信息不可用\n');
+    end
+    
+    %% 道路排水队调度路径（如果存在）
+    fprintf('\n  --- 道路排水队调度 ---\n');
+    if isfield(sch, 'road_drainage_assignment') && ~isempty(sch.road_drainage_assignment)
+        for team = 1:length(sch.road_drainage_assignment)
+            assignment = sch.road_drainage_assignment{team};
+            if isempty(assignment)
+                fprintf('    道路排水队%d: 无任务\n', team);
+                continue;
+            end
+            fprintf('    道路排水队%d:\n', team);
+            fprintf('      道路序列: ');
+            for k = 1:length(assignment)
+                road_idx = assignment(k);
+                fprintf('道路%d ', road_idx);
+                if k < length(assignment), fprintf('-> '); end
+            end
+            fprintf('\n');
+            if isfield(sch, 'road_unblock_time')
+                fprintf('      解除阻断时间: ');
+                for k = 1:length(assignment)
+                    road_idx = assignment(k);
+                    if road_idx <= length(sch.road_unblock_time)
+                        fprintf('道路%d(%.1fh) ', road_idx, sch.road_unblock_time(road_idx));
+                    end
+                end
+                fprintf('\n');
+            end
+        end
+    else
+        fprintf('    无道路排水任务或信息不可用\n');
+    end
+    
+    %% MES调度
+    fprintf('\n  --- MES调度 ---\n');
+    if isfield(sch, 'MES_sequence') && ~isempty(sch.MES_sequence)
+        for m = 1:length(sch.MES_sequence)
+            seq = sch.MES_sequence{m};
+            if isempty(seq)
+                fprintf('    MES%d: 无任务\n', m);
+                continue;
+            end
+            fprintf('    MES%d:\n', m);
+            fprintf('      服务序列: ');
+            for k = 1:length(seq)
+                fprintf('节点%d', seq(k));
+                if k < length(seq), fprintf(' -> '); end
+            end
+            fprintf('\n');
+            if isfield(sch, 'MES_arrival_times') && m <= length(sch.MES_arrival_times)
+                arr = sch.MES_arrival_times{m};
+                dur = sch.MES_service_durations{m};
+                fprintf('      到达/服务时长: ');
+                for k = 1:length(arr)
+                    fprintf('%.1fh/%.1fh ', arr(k), dur(k));
+                end
+                fprintf('\n');
+            end
+        end
+    else
+        fprintf('    MES: 未启用或无调度\n');
+    end
+    
+    %% UAV调度
+    fprintf('\n  --- UAV调度 ---\n');
+    if isfield(sch, 'UAV_sequence') && ~isempty(sch.UAV_sequence)
+        active_uav = 0;
+        for u = 1:length(sch.UAV_sequence)
+            seq = sch.UAV_sequence{u};
+            if ~isempty(seq)
+                active_uav = active_uav + 1;
+                fprintf('    UAV%d: 覆盖节点%d', u, seq(1));
+                if isfield(sch, 'UAV_arrival_times') && u <= length(sch.UAV_arrival_times)
+                    fprintf(' (到达: %.1fh)', sch.UAV_arrival_times{u}(1));
+                end
+                fprintf('\n');
+            end
+        end
+        if active_uav == 0
+            fprintf('    UAV: 无活动无人机\n');
+        end
+    else
+        fprintf('    UAV: 未启用\n');
+    end
+    
+    %% MCV调度
+    fprintf('\n  --- MCV调度 ---\n');
+    if isfield(sch, 'MCV_sequence') && ~isempty(sch.MCV_sequence)
+        for m = 1:length(sch.MCV_sequence)
+            seq = sch.MCV_sequence{m};
+            if isempty(seq)
+                fprintf('    MCV%d: 无任务\n', m);
+                continue;
+            end
+            fprintf('    MCV%d:\n', m);
+            fprintf('      服务序列: ');
+            for k = 1:length(seq)
+                fprintf('节点%d', seq(k));
+                if k < length(seq), fprintf(' -> '); end
+            end
+            fprintf('\n');
+            if isfield(sch, 'MCV_arrival_times') && m <= length(sch.MCV_arrival_times)
+                arr = sch.MCV_arrival_times{m};
+                stays = sch.MCV_stay_times{m};
+                fprintf('      到达/驻留时长: ');
+                for k = 1:min(length(arr), length(stays))
+                    fprintf('%.1fh/%.1fh ', arr(k), stays(k));
+                end
+                fprintf('\n');
+            end
+        end
+    else
+        fprintf('    MCV: 未启用\n');
+    end
+end
+end
+
+function metrics = calculate_metrics_v2(result, resources, params, config)
+metrics = struct();
+
+metrics.resilience_index = result.resilience_index;
+metrics.final_recovery = result.final_recovery;
+metrics.initial_recovery = result.recovery_ratio(1);
+
+T = params.T;
+Dt = params.Dt;
+
+%% ========== 使用全局目标函数计算成本 ==========
+
+%% 1. 负荷削减成本 (公式58) - 重新计算以确保一致性
+PL_MW = params.PL_kW / 1000;
+bus_weight = params.bus_weight;
+C_shed = 0;
+for t = 1:T
+    for i = 1:params.N
+        if i <= size(result.Xload, 1)
+            C_shed = C_shed + resources.c_shed * (1 - result.Xload(i,t)) * ...
+                     bus_weight(i) * PL_MW(i) * Dt;
+        end
+    end
+end
+metrics.load_shed_cost = resources.alpha * C_shed;  % 加权后的负荷削减成本
+
+%% 2. 部署成本 (公式59)
+n_dg_eff = length(config.use_dg) * (config.use_dg ~= 0);
+if config.use_dg && isfield(result, 'dg_power_out')
+    n_dg_eff = size(result.dg_power_out, 1);
+else
+    n_dg_eff = 0;
+end
+
+n_mes_eff = 0;
+if config.use_mes && isfield(result, 'mes_power_out')
+    n_mes_eff = size(result.mes_power_out, 1);
+end
+
+n_uav_eff = resources.n_uav * (config.use_uav ~= 0);
+n_mcv_eff = resources.n_mcv * (config.use_mcv ~= 0);
+
+metrics.deploy_cost = n_dg_eff * resources.c_DG + ...
+                      n_mes_eff * resources.c_MES + ...
+                      n_uav_eff * resources.c_UAV + ...
+                      n_mcv_eff * resources.c_MCV;
+
+%% 3. 运行成本 (公式60)
+% 从result中提取，如果存在
+if isfield(result, 'cost')
+    metrics.operate_cost = result.cost.C_operate;
+else
+    % 备用计算
+    dg_energy = 0;
+    if isfield(result, 'dg_power_out')
+        dg_energy = sum(sum(result.dg_power_out)) / 1000 * Dt;
+    end
+    
+    metrics.operate_cost = dg_energy * resources.dg_operate_cost + ...
+        n_mes_eff * T * Dt * resources.mes_operate_cost + ...
+        n_uav_eff * T * Dt * resources.uav_operate_cost + ...
+        n_mcv_eff * T * Dt * resources.mcv_operate_cost;
+end
+
+%% 4. 全局总成本 (公式57)
+% Z = α · C^shed + C^deploy + C^operate
+metrics.total_cost = metrics.load_shed_cost + metrics.deploy_cost + metrics.operate_cost;
+
+%% 其他指标保持不变
+metrics.recovery_efficiency = 0;
+for t = 1:T
+    metrics.recovery_efficiency = metrics.recovery_efficiency + t * result.total_load_served(t);
+end
+metrics.recovery_efficiency = metrics.recovery_efficiency / (T * result.total_load_MW);
+
+metrics.comm_stability = result.avg_connectivity;
+metrics.recovery_curve = result.recovery_ratio;
+
+t_80 = find(result.recovery_ratio >= 0.8, 1);
+if isempty(t_80)
+    metrics.t_80_recovery = inf;
+else
+    metrics.t_80_recovery = t_80 * Dt;
+end
+
+t_first = find(result.recovery_ratio > metrics.initial_recovery + 0.01, 1);
+if isempty(t_first)
+    metrics.t_first_recovery = inf;
+else
+    metrics.t_first_recovery = t_first * Dt;
+end
+
+%% 新增：成本分解详情
+metrics.cost_breakdown = struct();
+metrics.cost_breakdown.alpha = resources.alpha;
+metrics.cost_breakdown.C_shed_raw = C_shed;  % 未加权的负荷削减成本
+metrics.cost_breakdown.C_shed_weighted = metrics.load_shed_cost;
+metrics.cost_breakdown.C_deploy = metrics.deploy_cost;
+metrics.cost_breakdown.C_operate = metrics.operate_cost;
+
+end
+
+function print_metrics_comparison_v2(metrics, scheme_names)
+fprintf('\n========================================\n');
+fprintf('        性能指标对比\n');
+fprintf('========================================\n');
+
+fprintf('\n%-25s', '指标');
+for s = 1:4
+    fprintf('%15s', scheme_names{s});
+end
+fprintf('\n');
+fprintf('%s\n', repmat('-', 1, 85));
+
+fprintf('%-25s', '初始恢复率 (%)');
+for s = 1:4
+    fprintf('%15.2f', metrics{s}.initial_recovery * 100);
+end
+fprintf('\n');
+
+fprintf('%-25s', '最终恢复率 (%)');
+for s = 1:4
+    fprintf('%15.2f', metrics{s}.final_recovery * 100);
+end
+fprintf('\n');
+
+fprintf('%-25s', '首次恢复时间 (h)');
+for s = 1:4
+    if metrics{s}.t_first_recovery < inf
+        fprintf('%15.1f', metrics{s}.t_first_recovery);
+    else
+        fprintf('%15s', '>40');
+    end
+end
+fprintf('\n');
+
+fprintf('%-25s', '弹性指数');
+for s = 1:4
+    fprintf('%15.4f', metrics{s}.resilience_index);
+end
+fprintf('\n');
+
+fprintf('%-25s', '恢复效率');
+for s = 1:4
+    fprintf('%15.4f', metrics{s}.recovery_efficiency);
+end
+fprintf('\n');
+
+fprintf('%-25s', '经济指数');
+for s = 1:4
+    fprintf('%15.4f', metrics{s}.economic_index);
+end
+fprintf('\n');
+
+fprintf('%-25s', '通信稳定性 (%)');
+for s = 1:4
+    fprintf('%15.2f', metrics{s}.comm_stability * 100);
+end
+fprintf('\n');
+
+fprintf('%-25s', '80%%恢复时间 (h)');
+for s = 1:4
+    if metrics{s}.t_80_recovery < inf
+        fprintf('%15.1f', metrics{s}.t_80_recovery);
+    else
+        fprintf('%15s', '>40');
+    end
+end
+fprintf('\n');
+
+fprintf('\n--- 成本分解 ($) ---\n');
+
+fprintf('%-25s', '切负荷成本');
+for s = 1:4
+    fprintf('%15.0f', metrics{s}.load_shed_cost);
+end
+fprintf('\n');
+
+fprintf('%-25s', '部署成本');
+for s = 1:4
+    fprintf('%15.0f', metrics{s}.deploy_cost);
+end
+fprintf('\n');
+
+fprintf('%-25s', '运行成本');
+for s = 1:4
+    fprintf('%15.0f', metrics{s}.operate_cost);
+end
+fprintf('\n');
+
+fprintf('%-25s', '总成本');
+for s = 1:4
+    fprintf('%15.0f', metrics{s}.total_cost);
+end
+fprintf('\n');
+end
+
+function plot_load_recovery_curves_v2(results, scheme_names, params)
+figure('Name','Load Recovery Curves','Position',[100,100,1000,650],'Color','w');
+
+T = params.T;
+Dt = params.Dt;
+time = (0:T-1) * Dt;
+
+colors = [0.2 0.4 0.8; 0.9 0.3 0.2; 0.2 0.7 0.3; 0.8 0.5 0.2];
+lineStyles = {'-','--','-.',':'};
+markers = {'o', 's', 'd', '^'};  % 不同方案的标记
+lineWidth = 2.5;
+
+hold on;
+h = gobjects(4, 1);
+
+% 计算并显示初始失电率
+initial_recovery = results{1}.recovery_ratio(1);
+fprintf('\n  负荷恢复曲线绘制:\n');
+fprintf('    Initial recovery rate: %.2f%% (considering cascading outage)\n', initial_recovery * 100);
+
+for s = 1:4
+    y = results{s}.recovery_ratio(:)' * 100;
+
+    % 绘制主曲线
+    h(s) = plot(time, y, 'Color', colors(s,:), 'LineStyle', lineStyles{s}, ...
+        'LineWidth', lineWidth, 'DisplayName', scheme_names{s});
+
+    % 检测台阶上升点（负荷恢复跳变点）
+    step_threshold = 0.5;  % 0.5%的变化视为台阶
+    step_indices = find(diff(y) > step_threshold) + 1;
+
+    % 标记台阶上升点
+    if ~isempty(step_indices)
+        scatter(time(step_indices), y(step_indices), 80, colors(s,:), markers{s}, ...
+            'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 1.0, 'HandleVisibility', 'off');
+    end
+
+    % 标记首次恢复点（菱形标记）
+    first_recovery_idx = find(y > y(1) + 1, 1);
+    if ~isempty(first_recovery_idx)
+        scatter(time(first_recovery_idx), y(first_recovery_idx), 120, colors(s,:), 'd', ...
+            'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 1.5, 'HandleVisibility', 'off');
+    end
+end
+
+xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('Load Recovery Rate (%)', 'FontSize', 15, 'FontWeight', 'bold');
+title('Post-Disaster Load Recovery Process Comparison', 'FontSize', 15, 'FontWeight', 'bold');
+legend(h, 'Location', 'southeast', 'FontSize', 15);
+
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+grid on;
+xlim([0, (T-1)*Dt]);
+ylim([0, 105]);
+
+hold off;
+saveas(gcf, 'load_recovery_curves_v2.png');
+fprintf('  Load recovery curves saved: load_recovery_curves_v2.png\n');
+end
+
+function plot_admm_convergence_v2(results, scheme_names)
+figure('Name','ADMM Convergence','Position',[300,150,1100,450],'Color','w');
+
+colors = [0.2 0.4 0.8; 0.9 0.3 0.2; 0.2 0.7 0.3; 0.8 0.5 0.2];
+
+% 左图：原始残差
+subplot(1,2,1); hold on;
+for s = 1:4
+    if isfield(results{s}, 'admm_info') && isfield(results{s}.admm_info, 'primal_res')
+        res = results{s}.admm_info.primal_res;
+        res = res(res > 0);
+        if ~isempty(res)
+            semilogy(1:length(res), res, '-', 'Color', colors(s,:), 'LineWidth', 2, ...
+                'DisplayName', scheme_names{s});
+        end
+    end
+end
+xlabel('Iteration', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('Primal Residual (log scale)', 'FontSize', 15, 'FontWeight', 'bold');
+title('ADMM Primal Residual Convergence', 'FontSize', 15, 'FontWeight', 'bold');
+legend('Location', 'best', 'FontSize', 15);
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+hold off;
+
+% 右图：对偶残差
+subplot(1,2,2); hold on;
+for s = 1:4
+    if isfield(results{s}, 'admm_info') && isfield(results{s}.admm_info, 'dual_res')
+        res = results{s}.admm_info.dual_res;
+        res = res(res > 0);
+        if ~isempty(res)
+            semilogy(1:length(res), res, '-', 'Color', colors(s,:), 'LineWidth', 2, ...
+                'DisplayName', scheme_names{s});
+        end
+    end
+end
+xlabel('Iteration', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('Dual Residual (log scale)', 'FontSize', 15, 'FontWeight', 'bold');
+title('ADMM Dual Residual Convergence', 'FontSize', 15, 'FontWeight', 'bold');
+legend('Location', 'best', 'FontSize', 15);
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+hold off;
+
+saveas(gcf, 'admm_convergence_v2.png');
+fprintf('  ADMM convergence plot saved: admm_convergence_v2.png\n');
+end
+
+function plot_cascade_analysis_v2(power_net, params, result)
+%% 绘制级联失电分析图
+figure('Name','级联失电分析','Position',[500,200,900,700],'Color','w');
+
+N = params.N;
+coords = power_net.coords;
+Fset = params.Fset;
+cascade_info = params.cascade_info;
+
+% 节点分类
+fault_nodes = Fset;
+cascade_nodes = cascade_info.cascade_only_nodes;
+powered_nodes = setdiff(1:N, [fault_nodes(:); cascade_nodes(:)]);
+
+% 绘制线路
+hold on;
+for l = 1:power_net.n_lines
+    i = power_net.line_from(l);
+    j = power_net.line_to(l);
+    plot([coords(i,1), coords(j,1)], [coords(i,2), coords(j,2)], ...
+        'Color', [0.7 0.7 0.7], 'LineWidth', 1.5);
+end
+
+% 绘制不同类型节点
+scatter(coords(powered_nodes,1), coords(powered_nodes,2), 150, [0.2 0.7 0.2], ...
+    'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 1.5, 'DisplayName', '有电节点');
+scatter(coords(cascade_nodes,1), coords(cascade_nodes,2), 150, [1 0.6 0], ...
+    'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 1.5, 'DisplayName', '级联失电节点');
+scatter(coords(fault_nodes,1), coords(fault_nodes,2), 200, [0.9 0.2 0.2], ...
+    'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 2, 'DisplayName', '故障节点');
+
+% 标注变电站
+scatter(coords(1,1), coords(1,2), 300, [0 0 0.8], 'p', 'filled', ...
+    'MarkerEdgeColor', 'k', 'LineWidth', 2, 'DisplayName', '变电站');
+
+% 添加节点编号
+for i = 1:N
+    text(coords(i,1)+0.2, coords(i,2)+0.2, num2str(i), 'FontSize', 15);
+end
+
+xlabel('X坐标', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('Y坐标', 'FontSize', 15, 'FontWeight', 'bold');
+title(sprintf('初始失电状态分析\n故障节点: %d, 级联失电: %d, 总失负荷: %.1f%%', ...
+    length(fault_nodes), length(cascade_nodes), cascade_info.initial_loss_percent), ...
+    'FontSize', 15, 'FontWeight', 'bold');
+legend('Location', 'best', 'FontSize', 15);
+grid on;
+axis equal;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+hold off;
+
+saveas(gcf, 'cascade_analysis_v2.png');
+fprintf('  级联失电分析图已保存: cascade_analysis_v2.png\n');
+end
+
+function plot_mes_soc_curves(results, scheme_names, params)
+%% 绘制MES电量状态(SOC)变化曲线
+figure('Name','MES SOC Variation','Position',[150,150,900,500],'Color','w');
+
+T = params.T;
+Dt = params.Dt;
+time = (0:T-1) * Dt;
+
+colors = [0.2 0.4 0.8; 0.9 0.3 0.2; 0.2 0.7 0.3; 0.8 0.5 0.2];
+lineStyles = {'-','--','-.',':'};
+
+hold on;
+legend_entries = {};
+h_lines = [];
+
+for s = 1:4
+    if ~isfield(results{s}, 'mes_power_out')
+        continue;
+    end
+
+    mes_power = results{s}.mes_power_out;  % [n_mes x T]
+    n_mes = size(mes_power, 1);
+
+    if n_mes == 0
+        continue;
+    end
+
+    % 计算SOC曲线 (假设初始SOC=0.9, 容量5MWh, 效率0.88)
+    SOC_init = 0.9;
+    capacity_MWh = 5;
+    eta = 0.88;
+    sigma = 0.01;
+
+    for m = 1:n_mes
+        soc = zeros(1, T);
+        soc(1) = SOC_init;
+        for t = 2:T
+            energy_out = mes_power(m, t-1) / 1000 * Dt;  % MWh
+            soc(t) = soc(t-1) * (1 - sigma * Dt) - energy_out / (capacity_MWh * eta);
+            soc(t) = max(0.15, min(0.95, soc(t)));
+        end
+
+        h = plot(time, soc * 100, 'Color', colors(s,:), 'LineStyle', lineStyles{s}, ...
+            'LineWidth', 2);
+
+        if m == 1
+            h_lines = [h_lines, h];
+            legend_entries{end+1} = scheme_names{s};
+        end
+    end
+end
+
+% SOC安全边界
+yline(15, '--', 'SOC_{min}=15%', 'Color', [0.8 0.2 0.2], 'LineWidth', 1.5, ...
+    'LabelHorizontalAlignment', 'left', 'FontSize', 10);
+yline(95, '--', 'SOC_{max}=95%', 'Color', [0.2 0.6 0.2], 'LineWidth', 1.5, ...
+    'LabelHorizontalAlignment', 'left', 'FontSize', 10);
+
+xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('State of Charge (%)', 'FontSize', 15, 'FontWeight', 'bold');
+title('Mobile Energy Storage SOC Variation', 'FontSize', 15, 'FontWeight', 'bold');
+
+if ~isempty(h_lines)
+    legend(h_lines, legend_entries, 'Location', 'best', 'FontSize', 15);
+end
+
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+xlim([0, (T-1)*Dt]);
+ylim([0, 100]);
+hold off;
+
+saveas(gcf, 'mes_soc_curves.png');
+fprintf('  MES SOC curves saved: mes_soc_curves.png\n');
+end
+
+function plot_load_recovery_gantt(results, schedules, scheme_names, params)
+%% 绘制负荷恢复甘特图
+figure('Name','Recovery Gantt Chart','Position',[100,100,1200,600],'Color','w');
+
+Fset = params.Fset;
+F = length(Fset);
+Dt = params.Dt;
+T = params.T;
+
+colors_task = struct();
+colors_task.drain = [0.3 0.6 0.9];      % 蓝色-排水
+colors_task.repair = [0.9 0.5 0.2];     % 橙色-维修
+colors_task.restored = [0.2 0.8 0.3];   % 绿色-恢复完成
+
+% 只绘制方案1和方案2对比
+for s = 1:2
+    subplot(2, 1, s);
+    hold on;
+
+    sch = schedules{s};
+    result = results{s};
+
+    bar_height = 0.6;
+
+    for k = 1:F
+        node = Fset(k);
+        y = F - k + 1;  % 从上到下排列，确保y值递增
+
+        % 排水阶段
+        if isfield(sch, 'drain_complete_time') && k <= length(sch.drain_complete_time)
+            drain_end = sch.drain_complete_time(k);
+            if drain_end < inf && drain_end > 0
+                drain_start = max(0, drain_end - 2);  % 假设排水约2小时
+                rectangle('Position', [drain_start, y-bar_height/2, drain_end-drain_start, bar_height], ...
+                    'FaceColor', colors_task.drain, 'EdgeColor', 'k', 'LineWidth', 0.5);
+            end
+        end
+
+        % 维修阶段
+        if isfield(sch, 'repair_complete_time') && k <= length(sch.repair_complete_time)
+            repair_end = sch.repair_complete_time(k);
+            if repair_end < inf && repair_end > 0
+                if isfield(sch, 'drain_complete_time') && k <= length(sch.drain_complete_time)
+                    drain_end = sch.drain_complete_time(k);
+                else
+                    drain_end = 0;
+                end
+                repair_start = max(drain_end, repair_end - 3);  % 假设维修约3小时
+                rectangle('Position', [repair_start, y-bar_height/2, repair_end-repair_start, bar_height], ...
+                    'FaceColor', colors_task.repair, 'EdgeColor', 'k', 'LineWidth', 0.5);
+            end
+        end
+
+        % 标记恢复时刻
+        if isfield(result, 'Xload') && node <= size(result.Xload, 1)
+            Xload_node = result.Xload(node, :);
+            restore_t = find(Xload_node > 0.5, 1);
+            if ~isempty(restore_t)
+                plot(restore_t * Dt, y, 'p', 'MarkerSize', 12, 'MarkerFaceColor', colors_task.restored, ...
+                    'MarkerEdgeColor', 'k', 'LineWidth', 1);
+            end
+        end
+    end
+
+    % 设置坐标轴
+    xlim([0, T * Dt]);
+    ylim([0.5, F + 0.5]);
+
+    % Y轴标签（从下到上递增）
+    set(gca, 'YTick', 1:F);
+    y_labels = cell(F, 1);
+    for k = 1:F
+        y_labels{k} = sprintf('Node %d', Fset(F-k+1));
+    end
+    set(gca, 'YTickLabel', y_labels);
+
+    xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+    ylabel('Fault Nodes', 'FontSize', 15, 'FontWeight', 'bold');
+    title(sprintf('Recovery Timeline - %s', scheme_names{s}), 'FontSize', 15, 'FontWeight', 'bold');
+
+    grid on;
+    set(gca, 'Box', 'on', 'LineWidth', 1.0, 'FontSize', 15);
+    hold off;
+end
+
+% 添加图例说明
+annotation('textbox', [0.15, 0.02, 0.7, 0.04], 'String', ...
+    '■ Drainage  ■ Repair  ★ Restored', ...
+    'HorizontalAlignment', 'center', 'FontSize', 15, 'EdgeColor', 'none');
+
+saveas(gcf, 'recovery_gantt_chart.png');
+fprintf('  Recovery Gantt chart saved: recovery_gantt_chart.png\n');
+end
+
+function plot_metrics_radar_v3(metrics, scheme_names)
+    %% IEEE Transactions 风格雷达图 (V3: 大字号 + 紧凑图例版)
+    
+    % 1. 设置画布
+    % 适当增加高度以容纳底部图例和大字号标签
+    fig = figure('Units', 'centimeters', 'Position', [5, 5, 18, 16], ...
+                 'Color', 'w', 'Name', 'IEEE_Radar_Chart');
+
+    % 2. 定义样式
+    ieee_colors = [0 0.4470 0.7410; 0.8500 0.3250 0.0980; ...
+                   0.4660 0.6740 0.1880; 0.4940 0.1840 0.5560]; 
+    ieee_markers = {'o', 's', '^', 'd', 'v'};
+    ieee_lines   = {'-', '--', '-.', ':'};
+    labels = {'Resilience Index', 'Recovery Efficiency', 'Economic Index', ...
+              'Comm. Stability', 'Recovery Speed ($s^{-1}$)'}; 
+    
+    n_metrics = length(labels);
+    n_schemes = length(scheme_names);
+    
+    %% 3. 数据预处理
+    data = zeros(n_schemes, n_metrics);
+    for s = 1:n_schemes
+        data(s, 1) = metrics{s}.resilience_index;
+        data(s, 2) = metrics{s}.recovery_efficiency;
+        data(s, 3) = metrics{s}.economic_index;
+        data(s, 4) = metrics{s}.comm_stability;
+        if metrics{s}.t_80_recovery < inf && metrics{s}.t_80_recovery > 0
+            data(s, 5) = 1 / metrics{s}.t_80_recovery;
+        else
+            data(s, 5) = 0.01; 
+        end
+    end
+
+    % Min-Max 归一化
+    data_norm = data;
+    for j = 1:n_metrics
+        col_min = min(data(:, j));
+        col_max = max(data(:, j));
+        if abs(col_max - col_min) > 1e-6
+            data_norm(:, j) = 0.1 + 0.9 * (data(:, j) - col_min) / (col_max - col_min);
+        else
+            data_norm(:, j) = 1.0; 
+        end
+    end
+    
+    %% 4. 绘图核心逻辑
+    
+    % 调整：手动控制坐标轴区域，拉近图例与图的距离
+    % [left bottom width height] -> 减小 bottom 值可以让图尽量靠下
+    ax = axes('Position', [0.1 0.18 0.8 0.75]); 
+    
+    % 角度设置：从12点钟方向(pi/2)开始
+    start_angle = pi/2;
+    theta = linspace(start_angle, start_angle + 2*pi, n_metrics + 1); 
+    
+    hold on;
+    
+    % --- A. 绘制多边形网格与刻度 ---
+    grid_levels = 0.2:0.2:1.0;
+    for level = grid_levels
+        grid_x = level * cos(theta);
+        grid_y = level * sin(theta);
+        plot(grid_x, grid_y, '-', 'Color', [0.85 0.85 0.85], 'LineWidth', 0.8, 'HandleVisibility', 'off');
+        
+        % 【修改1】 刻度值：保持垂直，做偏移，加深字号
+        % 坐标 (0, level) 是正上方，x轴加 0.03 的偏移量
+        % text(0.04, level, sprintf('%.1f', level), ...
+        %      'HorizontalAlignment', 'left', ...
+        %      'VerticalAlignment', 'middle', ...
+        %      'FontSize', 9, ...         % 刻度字号适中即可
+        %      'FontName', 'Times New Roman', ...
+        %      'FontWeight', 'bold', ...  % 加粗
+        %      'Color', 'k');             % 纯黑
+    end
+    
+    % --- B. 绘制辐射轴 ---
+    for j = 1:n_metrics
+        plot([0, cos(theta(j))], [0, sin(theta(j))], '-', ...
+             'Color', [0.6 0.6 0.6], 'LineWidth', 1.0, 'HandleVisibility', 'off');
+    end
+    
+    % --- C. 绘制数据系列 ---
+    h_plots = [];
+    for s = 1:n_schemes
+        current_norm = [data_norm(s, :), data_norm(s, 1)]; 
+        current_raw  = [data(s, :), data(s, 1)];
+        
+        x_data = current_norm .* cos(theta);
+        y_data = current_norm .* sin(theta);
+        
+        c_idx = mod(s-1, size(ieee_colors, 1)) + 1;
+        scheme_color = ieee_colors(c_idx,:);
+        
+        fill(x_data, y_data, scheme_color, 'FaceAlpha', 0.05, 'EdgeColor', 'none', 'HandleVisibility', 'off');
+        
+        p = plot(x_data, y_data, ...
+            'Color', scheme_color, ...
+            'LineStyle', ieee_lines{mod(s-1, length(ieee_lines)) + 1}, ...
+            'LineWidth', 2, ... % 线条稍微加粗配合大字体
+            'Marker', ieee_markers{mod(s-1, length(ieee_markers)) + 1}, ...
+            'MarkerSize', 8, ...
+            'MarkerFaceColor', 'w');
+        
+        h_plots = [h_plots, p];
+        
+        % --- 【修改2】 蓝色方案数值：字号改到 13 ---
+        if s == 1
+            for k = 1:n_metrics
+                tx = x_data(k);
+                ty = y_data(k);
+                
+                % 智能偏移逻辑
+                angle_k = theta(k);
+                offset_dist = 0.12; % 增加偏移距离，给大字体留空间
+                
+                if abs(cos(angle_k)) < 0.1 % 垂直轴
+                    ha = 'left'; va = 'bottom';
+                    offset_x = 0.03; offset_y = 0.03;
+                elseif cos(angle_k) > 0 % 右侧
+                    ha = 'left'; va = 'middle';
+                    offset_x = offset_dist; offset_y = 0;
+                else % 左侧
+                    ha = 'right'; va = 'middle';
+                    offset_x = -offset_dist; offset_y = 0;
+                end
+                
+                text(tx + offset_x, ty + offset_y, sprintf('%.2f', current_raw(k)), ...
+                    'Color', scheme_color, ...
+                    'FontSize', 13, ...        % <--- 字号 13
+                    'FontWeight', 'bold', ...
+                    'FontName', 'Times New Roman', ...
+                    'HorizontalAlignment', ha, ...
+                    'VerticalAlignment', va, ...
+                    'BackgroundColor', 'w', ...
+                    'Margin', 0.5);
+            end
+        end
+    end
+    
+    % --- D. 绘制指标标签 ---
+    % 【修改3】 标签字号改到 15，并增加半径防止重叠
+    label_radius = 1.35; 
+    for j = 1:n_metrics
+        lx = label_radius * cos(theta(j));
+        ly = label_radius * sin(theta(j));
+        
+        % 对齐微调
+        if abs(lx) < 0.1, horz_align = 'center';
+        elseif lx > 0, horz_align = 'left';
+        else, horz_align = 'right'; end
+        
+        if abs(ly) < 0.1, vert_align = 'middle';
+        elseif ly > 0, vert_align = 'bottom';
+        else, vert_align = 'top'; end
+        
+        text(lx, ly, labels{j}, ...
+             'HorizontalAlignment', horz_align, ...
+             'VerticalAlignment', vert_align, ...
+             'Interpreter', 'latex', ...
+             'FontName', 'Times New Roman', ...
+             'FontSize', 15, ...       % <--- 字号 15
+             'FontWeight', 'bold');
+    end
+    
+    %% 5. 导出与美化
+    axis equal; axis off;
+    
+    % 【修改4】 图例紧凑化
+    % 将图例放在 southoutside，但因为上面手动调整了 axes position (0.18 bottom)，
+    % 图例会紧贴着图的下方显示。
+    lgd = legend(h_plots, scheme_names, ...
+           'Location', 'southoutside', ...
+           'Orientation', 'horizontal', ...
+           'Box', 'off', ...
+           'FontName', 'Times New Roman', ...
+           'FontSize', 11); % 图例字体也稍微加大以匹配整体
+    
+    % 扩大显示范围，防止大字体标签被裁剪
+    margin = 0.4;
+    xlim([-1.3-margin, 1.3+margin]);
+    ylim([-1.3-margin, 1.3+margin]);
+
+    fprintf('Radar chart updated: Large Fonts (13/15) + Compact Legend.\n');
+end
+
+function plot_comm_coverage_curves(results, scheme_names, params)
+%% 绘制四种方案通信网连通覆盖率变化曲线
+figure('Name','Communication Coverage','Position',[250,150,900,550],'Color','w');
+
+T = params.T;
+Dt = params.Dt;
+time = (0:T-1) * Dt;
+
+colors = [0.2 0.4 0.8; 0.9 0.3 0.2; 0.2 0.7 0.3; 0.8 0.5 0.2];
+lineStyles = {'-','--','-.',':'};
+lineWidth = 2.5;
+
+hold on;
+h = gobjects(4, 1);
+
+for s = 1:4
+    if isfield(results{s}, 'C_comm')
+        % 计算每个时刻的覆盖率
+        C_comm = results{s}.C_comm;  % [N x T]
+        coverage_ratio = mean(C_comm, 1) * 100;  % 平均覆盖率
+    elseif isfield(results{s}, 'connectivity_ratio')
+        coverage_ratio = results{s}.connectivity_ratio(:)' * 100;
+    else
+        coverage_ratio = ones(1, T) * 50;  % 默认值
+    end
+
+    h(s) = plot(time, coverage_ratio, 'Color', colors(s,:), 'LineStyle', lineStyles{s}, ...
+        'LineWidth', lineWidth, 'DisplayName', scheme_names{s});
+
+    % 标记关键点
+    [max_cov, max_idx] = max(coverage_ratio);
+    scatter(time(max_idx), max_cov, 100, colors(s,:), 'p', 'filled', ...
+        'MarkerEdgeColor', 'k', 'LineWidth', 1, 'HandleVisibility', 'off');
+end
+
+% 参考线
+yline(80, '--', '80% Target', 'Color', [0.3 0.3 0.3], 'LineWidth', 1.5, ...
+    'LabelHorizontalAlignment', 'left', 'FontSize', 15);
+yline(100, ':', 'Full Coverage', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, ...
+    'LabelHorizontalAlignment', 'left', 'FontSize', 15);
+
+xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('Communication Coverage Rate (%)', 'FontSize', 15, 'FontWeight', 'bold');
+title('Communication Network Coverage Comparison', 'FontSize', 15, 'FontWeight', 'bold');
+legend(h, 'Location', 'best', 'FontSize', 15);
+
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+xlim([0, (T-1)*Dt]);
+ylim([0, 105]);
+
+hold off;
+
+saveas(gcf, 'comm_coverage_curves.png');
+fprintf('  Communication coverage curves saved: comm_coverage_curves.png\n');
+end
+
+function plot_mes_dg_power_output(results, scheme_names, params, resources)
+%% 绘制MES和DG出力曲线
+figure('Name','MES and DG Power Output','Position',[150,100,1200,500],'Color','w');
+
+T = params.T;
+Dt = params.Dt;
+time = (0:T-1) * Dt;
+
+colors = [0.2 0.4 0.8; 0.9 0.3 0.2; 0.2 0.7 0.3; 0.8 0.5 0.2];
+lineStyles = {'-','--','-.',':'};
+
+%% 子图1：MES出力
+subplot(1, 2, 1);
+hold on;
+
+h_mes = [];
+legend_entries_mes = {};
+
+for s = 1:4
+    if isfield(results{s}, 'mes_power_out') && ~isempty(results{s}.mes_power_out)
+        mes_power = results{s}.mes_power_out;  % [n_mes x T]
+        total_mes_power = sum(mes_power, 1) / 1000;  % 转换为MW
+
+        h = plot(time, total_mes_power, 'Color', colors(s,:), 'LineStyle', lineStyles{s}, ...
+            'LineWidth', 2.5, 'DisplayName', scheme_names{s});
+        h_mes = [h_mes, h];
+        legend_entries_mes{end+1} = scheme_names{s};
+
+        % 标记最大出力点
+        [max_power, max_idx] = max(total_mes_power);
+        if max_power > 0
+            scatter(time(max_idx), max_power, 80, colors(s,:), 'p', 'filled', ...
+                'MarkerEdgeColor', 'k', 'HandleVisibility', 'off');
+        end
+    end
+end
+
+% MES额定功率参考线
+mes_max_total = resources.n_mes * resources.mes_max_kW / 1000;
+yline(mes_max_total, '--', sprintf('Rated: %.2f MW', mes_max_total), ...
+    'Color', [0.5 0.5 0.5], 'LineWidth', 1.5, 'LabelHorizontalAlignment', 'left', 'FontSize', 15);
+
+xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('MES Power Output (MW)', 'FontSize', 15, 'FontWeight', 'bold');
+title('Mobile Energy Storage Output', 'FontSize', 15, 'FontWeight', 'bold');
+
+if ~isempty(h_mes)
+    legend(h_mes, legend_entries_mes, 'Location', 'best', 'FontSize', 15);
+end
+
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+xlim([0, (T-1)*Dt]);
+ylim([0, mes_max_total * 1.2]);
+hold off;
+
+%% 子图2：DG出力
+subplot(1, 2, 2);
+hold on;
+
+h_dg = [];
+legend_entries_dg = {};
+
+for s = 1:4
+    if isfield(results{s}, 'dg_power_out') && ~isempty(results{s}.dg_power_out)
+        dg_power = results{s}.dg_power_out;  % [n_dg x T]
+        total_dg_power = sum(dg_power, 1) / 1000;  % 转换为MW
+
+        h = plot(time, total_dg_power, 'Color', colors(s,:), 'LineStyle', lineStyles{s}, ...
+            'LineWidth', 2.5, 'DisplayName', scheme_names{s});
+        h_dg = [h_dg, h];
+        legend_entries_dg{end+1} = scheme_names{s};
+
+        % 标记最大出力点
+        [max_power, max_idx] = max(total_dg_power);
+        if max_power > 0
+            scatter(time(max_idx), max_power, 80, colors(s,:), 'p', 'filled', ...
+                'MarkerEdgeColor', 'k', 'HandleVisibility', 'off');
+        end
+    end
+end
+
+% DG额定功率参考线
+dg_max_total = resources.n_dg * resources.dg_max_MW;
+yline(dg_max_total, '--', sprintf('Rated: %.2f MW', dg_max_total), ...
+    'Color', [0.5 0.5 0.5], 'LineWidth', 1.5, 'LabelHorizontalAlignment', 'left', 'FontSize', 15);
+
+xlabel('Time (hours)', 'FontSize', 15, 'FontWeight', 'bold');
+ylabel('DG Power Output (MW)', 'FontSize', 15, 'FontWeight', 'bold');
+title('Diesel Generator Output', 'FontSize', 15, 'FontWeight', 'bold');
+
+if ~isempty(h_dg)
+    legend(h_dg, legend_entries_dg, 'Location', 'best', 'FontSize', 15);
+end
+
+grid on;
+set(gca, 'Box', 'on', 'LineWidth', 1.2, 'FontSize', 15);
+xlim([0, (T-1)*Dt]);
+ylim([0, dg_max_total * 1.2]);
+hold off;
+
+saveas(gcf, 'mes_dg_power_output.png');
+fprintf('  MES and DG power output curves saved: mes_dg_power_output.png\n');
+end
